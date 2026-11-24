@@ -85,6 +85,14 @@ CFGTM_DIR=/opt/cf-gtm CFGTM_PORT=8787 bash install.sh
 
 ### 方式一：宝塔面板 + Supervisor（推荐生产）
 
+> 宝塔环境也可以直接用一键脚本：脚本会自动识别宝塔（检测 `/www/server/panel`），把代码拉到 `/www/wwwroot/cf-gtm` 并写入 Supervisor 配置，不用手动上传文件。
+>
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/227696934/CF-GTM-/main/install.sh | bash
+> ```
+>
+> 装完在宝塔 → Supervisor 管理器里能看到 `cf-gtm` 进程。下面的手动步骤留作参考。
+
 #### 1. 上传代码
 
 把 `app.py`、`requirements.txt`、`config.example.json` 上传到服务器：
