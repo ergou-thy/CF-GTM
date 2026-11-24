@@ -1,0 +1,38 @@
+{
+  "cloudflare": {
+    "api_token": "YOUR_CF_API_TOKEN",
+    "zone_id": "YOUR_ZONE_ID",
+    "record_name": "ddns.example.com",
+    "record_type": "CNAME"
+  },
+  "probe": {
+    "interval_seconds": 60,
+    "timeout_seconds": 10,
+    "fail_threshold": 2,
+    "decision_mode": "api_only",
+    "api_url": "https://v2.xxapi.cn/api/ping?url={target}",
+    "record_ttl": 60
+  },
+  "scheduler": {
+    "slice_seconds": 3600
+  },
+  "auto_window": {
+    "enabled": false,
+    "start": "00:00",
+    "end": "23:59"
+  },
+  "cooldown_minutes": 0,
+  "nodes": [
+    {"name": "日本1", "target": "jp1.example.com", "port": 443, "weight": 3, "enabled": true},
+    {"name": "日本2", "target": "jp2.example.com", "port": 443, "weight": 2, "enabled": true},
+    {"name": "新加坡1", "target": "sg1.example.com", "port": 443, "weight": 1, "enabled": true}
+  ],
+  "mode": "weighted",
+  "auto_switch": true,
+  "dry_run": true,
+  "web": {
+    "host": "127.0.0.1",
+    "port": 8787,
+    "password": "CHANGE_ME"
+  }
+}
