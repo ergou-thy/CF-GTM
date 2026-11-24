@@ -50,7 +50,7 @@ CF-GTM（部署在一台能上网的机器上，香港 / 国内均可）
 在一台 Linux 服务器上（Debian/Ubuntu/CentOS 都行）用 root 执行：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ergou-thy/CF-GTM-/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ergou-thy/CF-GTM/main/install.sh | bash
 ```
 
 脚本会自动：
@@ -88,7 +88,7 @@ CFGTM_DIR=/opt/cf-gtm CFGTM_PORT=8787 bash install.sh
 > 宝塔环境也可以直接用一键脚本：脚本会自动识别宝塔（检测 `/www/server/panel`），把代码拉到 `/www/wwwroot/cf-gtm` 并写入 Supervisor 配置，不用手动上传文件。
 >
 > ```bash
-> curl -fsSL https://raw.githubusercontent.com/ergou-thy/CF-GTM-/main/install.sh | bash
+> curl -fsSL https://raw.githubusercontent.com/ergou-thy/CF-GTM/main/install.sh | bash
 > ```
 >
 > 装完在宝塔 → Supervisor 管理器里能看到 `cf-gtm` 进程。下面的手动步骤留作参考。
