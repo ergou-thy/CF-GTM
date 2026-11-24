@@ -4,13 +4,13 @@
 # 宝塔面板：自动写入 Supervisor 配置
 #
 # 用法：
-#   curl -fsSL https://raw.githubusercontent.com/ergou-thy/CF-GTM-/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/ergou-thy/CF-GTM/main/install.sh | bash
 # 可选：
 #   CFGTM_DIR=/www/wwwroot/cf-gtm CFGTM_PORT=8787 bash install.sh
 
 set -e
 
-REPO="ergou-thy/CF-GTM-"
+REPO="ergou-thy/CF-GTM"
 BRANCH="main"
 PORT="${CFGTM_PORT:-8787}"
 
