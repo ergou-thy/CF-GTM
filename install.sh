@@ -1,16 +1,16 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 # CF-GTM 一键安装脚本
 # 普通 Linux：systemd 守护
 # 宝塔面板：自动写入 Supervisor 配置
 #
 # 用法：
-#   curl -fsSL https://raw.githubusercontent.com/227696934/CF-GTM-/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/ergou-thy/CF-GTM-/main/install.sh | bash
 # 可选：
 #   CFGTM_DIR=/www/wwwroot/cf-gtm CFGTM_PORT=8787 bash install.sh
 
 set -e
 
-REPO="227696934/CF-GTM-"
+REPO="ergou-thy/CF-GTM-"
 BRANCH="main"
 PORT="${CFGTM_PORT:-8787}"
 
