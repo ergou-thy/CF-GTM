@@ -1,0 +1,14 @@
+[Unit]
+Description=CF-GTM (Cloudflare DNS failover panel)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/cf-gtm
+ExecStart=/opt/cf-gtm/venv/bin/python /opt/cf-gtm/app.py
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
