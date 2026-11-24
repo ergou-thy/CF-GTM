@@ -45,7 +45,45 @@ CF-GTM（部署在一台能上网的机器上，香港 / 国内均可）
 
 ## 快速开始
 
-### 方式一：宝塔面板 + Supervisor（推荐，本仓库的默认部署方式）
+### 方式零：一键脚本（最简单，1 分钟）
+
+在一台 Linux 服务器上（Debian/Ubuntu/CentOS 都行）用 root 执行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/227696934/CF-GTM-/main/install.sh | bash
+```
+
+脚本会自动：
+
+1. 安装 python3 / venv / 依赖；
+2. 从 GitHub 拉取代码到 `/opt/cf-gtm`；
+3. 生成 `config.json`（随机面板密码、正式模式）；
+4. 注册 systemd 服务并启动。
+
+安装完成后会打印：
+
+```
+访问地址：http://你的服务器IP:8787
+面板密码：xxxxxxxx
+```
+
+**不需要手动改配置文件**，直接打开地址登录，然后在面板里完成：
+
+- 右上角「主域名」→ 填 CF Token、Zone ID、主域名；
+- 「节点管理」→ 添加你的节点；
+- 「探测设置」→ 可换成自己的国内探测接口。
+
+自定义安装目录或端口：
+
+```bash
+CFGTM_DIR=/opt/cf-gtm CFGTM_PORT=8787 bash install.sh
+```
+
+> 8787 直接暴露公网不够安全，生产环境建议加 Nginx 反代 + HTTPS（见方式一）。
+
+---
+
+### 方式一：宝塔面板 + Supervisor（推荐生产）
 
 #### 1. 上传代码
 
