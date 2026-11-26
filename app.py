@@ -2,21 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 CF-GTM —— 基于 Cloudflare DNS 的轻量级全局流量管理（GTM 平替）
-
 桃花酱出品 · @taohuayuang
 
-三种模式：
-  failover     单条记录，节点故障时切换目标（主备容灾）
-  round_robin  主域名多条 A 记录，等概率轮询 + 故障摘除（无权重）
-  weighted     单条记录，按权重做时间片轮换（带一点均衡 + 故障切换）
-
-健康检查 = xxapi.cn 国内 Ping 接口（ICMP） + 本地 TCP 端口探测
-自带 Web 控制台：主域名绑定、节点增删、频率/权重设置、日志
-
-运行：
-  pip install -r requirements.txt
-  python app.py
-  浏览器打开 http://<服务器IP>:8787
+failover：单条记录主备容灾；round_robin：多 A 记录；weighted：时间片权重轮换。
+运行：pip install -r requirements.txt && python app.py
+普通 import 不加载配置、不发起网络请求、不启动后台。WSGI 部署请显式调用 init_app。
 """
 
 import os
@@ -25,369 +15,724 @@ import time
 import socket
 import secrets
 import threading
+import copy
+import hashlib
+import hmac
+import math
+import ipaddress
+import re
+import stat
+import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from urllib.parse import quote
+from functools import wraps
+from string import Formatter
+from urllib.parse import quote, urlsplit
 
 import requests
-from flask import Flask, request, jsonify, Response, session, redirect
+from flask import Flask, request, jsonify, session, redirect, render_template, send_file
+from flask.sessions import SecureCookieSessionInterface
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 # ---------------------------------------------------------------- 基础路径
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 STATE_PATH = os.path.join(BASE_DIR, "state.json")
-
 CF_API = "https://api.cloudflare.com/client/v4"
+VERSION = "20261126-gtm4"
 
 DEFAULT_CONFIG = {
-    "cloudflare": {
-        "api_token": "",
-        "zone_id": "",
-        "record_name": "main.example.com",
-        "record_type": "CNAME",
-    },
+    "cloudflare": {"api_token": "", "zone_id": "", "record_name": "main.example.com", "record_type": "CNAME"},
     "probe": {
-        "interval_seconds": 60,
-        "timeout_seconds": 10,
-        "fail_threshold": 2,
-        "decision_mode": "smart",
-        "api_url": "https://v2.xxapi.cn/api/ping?url={target}",
-        "record_ttl": 60,
+        "interval_seconds": 60, "timeout_seconds": 10, "fail_threshold": 2,
+        "decision_mode": "smart", "api_url": "https://v2.xxapi.cn/api/ping?url={target}", "record_ttl": 60,
     },
-    "scheduler": {
-        "slice_seconds": 300,
-    },
-    "auto_window": {
-        "enabled": False,
-        "start": "00:00",
-        "end": "23:59",
-    },
+    "scheduler": {"slice_seconds": 300},
+    "auto_window": {"enabled": False, "start": "00:00", "end": "23:59"},
     "cooldown_minutes": 0,
     "nodes": [
         {"name": "日本A", "target": "jp1.example.com", "port": 443, "weight": 1},
         {"name": "新加坡A", "target": "sg1.example.com", "port": 443, "weight": 1},
     ],
-    "mode": "failover",
-    "auto_switch": True,
-    "dry_run": False,
+    "mode": "failover", "auto_switch": True, "dry_run": False,
     "web": {"host": "0.0.0.0", "port": 8787, "password": ""},
 }
 
 app = Flask(__name__)
+app.config.update(MAX_CONTENT_LENGTH=131072, SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
 lock = threading.RLock()
-
+operation_lock = threading.RLock()
+persistence_lock = threading.RLock()
+probe_lock = threading.Lock()
+stop_event = threading.Event()
 config = {}
-state = {
-    "current": "",
-    "record_id": "",
-    "records": {},
-    "nodes": {},
-    "logs": [],
-    "started_at": "",
-    "last_round": "",
-    "cf_error": "",
-    "weighted": {"acc": {}, "last_slice": 0},
-    "last_switch_ts": 0,
-}
+_config_revision = 0
+_initialized = False
+_background_thread = None
 
 
-# ---------------------------------------------------------------- 工具函数
+def new_state():
+    return {
+        "current": "", "current_target": "", "record_id": "", "records": {}, "nodes": {},
+        "logs": [], "started_at": "", "last_round": "", "cf_error": "", "cf_loaded": False,
+        "dns_records": [], "owned_records": {}, "dns_scope": "", "unmanaged_records": [],
+        "weighted": {"acc": {}, "last_slice": 0}, "last_switch_ts": 0,
+        "probing": False, "last_probe_error": "", "simulation": {}, "cf_observed_at": "", "cf_stale": True,
+    }
+
+
+state = new_state()
+
+
+class LoopbackProxy:
+    """仅信任本机反代的一层协议头；绝不改写鉴权所见的来源 IP/主机。"""
+    def __init__(self, wrapped):
+        self.wrapped = wrapped
+        self.proxied = ProxyFix(wrapped, x_for=0, x_proto=1, x_host=0, x_port=0, x_prefix=0)
+
+    def __call__(self, environ, start_response):
+        try:
+            trusted = ipaddress.ip_address(environ.get("REMOTE_ADDR", "")).is_loopback
+        except ValueError:
+            trusted = False
+        return (self.proxied if trusted else self.wrapped)(environ, start_response)
+
+
+class SchemeSessionInterface(SecureCookieSessionInterface):
+    def get_cookie_secure(self, application):
+        return bool(application.config.get("SESSION_COOKIE_SECURE")) or request.is_secure
+
+
+app.wsgi_app = LoopbackProxy(app.wsgi_app)
+app.session_interface = SchemeSessionInterface()
+
+# ---------------------------------------------------------------- 工具函数 / 原子配置
+
+
+class ValidationError(ValueError):
+    pass
+
 
 def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def safe_error(error) -> str:
+    message = str(error)
+    with lock:
+        sensitive = [config.get("cloudflare", {}).get("api_token"),
+                     config.get("web", {}).get("password"), config.get("web", {}).get("secret")]
+    for value in sensitive:
+        if isinstance(value, str) and value:
+            message = message.replace(value, "[已隐藏]")
+    message = re.sub(r"Bearer\s+\S+", "Bearer [已隐藏]", message, flags=re.I)
+    return message[:400]
+
+
 def log(msg: str, level: str = "info") -> None:
-    entry = {"ts": now_str(), "level": level, "msg": str(msg)}
+    msg = safe_error(msg)
+    entry = {"ts": now_str(), "level": level, "msg": msg}
     with lock:
         state["logs"].insert(0, entry)
         del state["logs"][200:]
     print(f"[{entry['ts']}] [{level.upper()}] {msg}", flush=True)
     try:
-        with open(os.path.join(BASE_DIR, "gtm.log"), "a", encoding="utf-8") as f:
-            f.write(f"[{entry['ts']}] [{level.upper()}] {msg}\n")
+        with open(os.path.join(BASE_DIR, "gtm.log"), "a", encoding="utf-8") as stream:
+            stream.write(f"[{entry['ts']}] [{level.upper()}] {msg}\n")
     except OSError:
         pass
 
 
 def deep_merge(base: dict, override: dict) -> dict:
-    out = dict(base)
-    for k, v in (override or {}).items():
-        if isinstance(v, dict) and isinstance(out.get(k), dict):
-            out[k] = deep_merge(out[k], v)
+    out = copy.deepcopy(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = deep_merge(out[key], value)
         else:
-            out[k] = v
+            out[key] = copy.deepcopy(value)
     return out
 
 
-def load_config() -> None:
-    global config
-    if not os.path.exists(CONFIG_PATH):
-        config = json.loads(json.dumps(DEFAULT_CONFIG))
-        save_config()
-        log("未找到 config.json，已生成示例配置", "warn")
-    else:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            user_cfg = json.load(f)
-        config = deep_merge(DEFAULT_CONFIG, user_cfg)
-
-    for n in config.get("nodes") or []:
-        n.setdefault("weight", 1)
-        n.setdefault("enabled", True)
-    if config.get("mode") not in ("failover", "round_robin", "weighted"):
-        config["mode"] = "failover"
-
-    web = config.setdefault("web", {})
-    if not web.get("password"):
-        pwd = secrets.token_urlsafe(9)
-        web["password"] = pwd
-        save_config()
-        print(f"[安全] 未设置面板密码，已自动生成：{pwd}（可在面板「安全」里修改）", flush=True)
-    if not web.get("secret"):
-        web["secret"] = secrets.token_hex(16)
-        save_config()
-
-    with lock:
-        state["current"] = config["nodes"][0]["target"] if config["nodes"] else ""
+def text_value(value, name, maximum=4096, allow_empty=False):
+    if not isinstance(value, str):
+        raise ValidationError(f"{name} 必须是文本")
+    value = value.strip()
+    if (not value and not allow_empty) or len(value) > maximum or any(ord(c) < 32 for c in value):
+        raise ValidationError(f"{name} 为空、过长或含控制字符")
+    return value
 
 
-def save_config() -> None:
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(config, f, ensure_ascii=False, indent=2)
-
-
-def save_state() -> None:
+def int_value(value, name, minimum, maximum):
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValidationError(f"{name} 必须是整数")
+    if isinstance(value, str) and not re.fullmatch(r"[0-9]+", value.strip()):
+        raise ValidationError(f"{name} 必须是整数")
     try:
-        with open(STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-    except OSError:
-        pass
+        number = int(value)
+    except (ValueError, OverflowError):
+        raise ValidationError(f"{name} 必须是整数") from None
+    if not minimum <= number <= maximum:
+        raise ValidationError(f"{name} 必须在 {minimum}..{maximum} 之间")
+    return number
+
+
+def bool_value(value, name):
+    if not isinstance(value, bool):
+        raise ValidationError(f"{name} 必须是布尔值")
+    return value
+
+
+def hostname(value, name="target", allow_ip=True):
+    value = text_value(value, name, 253).rstrip(".")
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        address = None
+    if address is not None:
+        if not allow_ip or address.version != 4:
+            raise ValidationError(f"{name} 必须是域名或 IPv4 地址" if allow_ip else f"{name} 必须是域名")
+        return str(address)
+    try:
+        value = value.encode("idna").decode("ascii").lower()
+    except UnicodeError:
+        raise ValidationError(f"{name} 域名非法") from None
+    if len(value) > 253 or not all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                                   for label in value.split(".")):
+        raise ValidationError(f"{name} 域名非法")
+    if re.fullmatch(r"[0-9.]+", value):
+        raise ValidationError(f"{name} IPv4 地址非法")
+    return value
+
+
+def validate_api_url(value):
+    value = text_value(value, "api_url", 2048)
+    try:
+        fields = list(Formatter().parse(value))
+    except ValueError:
+        raise ValidationError("探测接口模板的大括号不完整") from None
+    if not any(field == "target" for _, field, _, _ in fields):
+        raise ValidationError("探测接口必须包含 {target} 占位符")
+    if any(field is not None and (field != "target" or spec or conversion)
+           for _, field, spec, conversion in fields):
+        raise ValidationError("探测接口仅支持 {target} 占位符")
+    try:
+        parsed = urlsplit(value.format(target="example.com"))
+        valid = parsed.scheme in ("http", "https") and parsed.hostname and not parsed.username and not parsed.password
+        valid = valid and not parsed.fragment and (parsed.port is None or 1 <= parsed.port <= 65535)
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ValidationError("探测接口必须是有效的 http/https 地址")
+    return value
+
+
+def validate_config(candidate):
+    """只修改候选副本，完整通过后才允许持久化与发布。"""
+    if not isinstance(candidate, dict):
+        raise ValidationError("配置必须是对象")
+    candidate = copy.deepcopy(candidate)
+    for section in ("cloudflare", "probe", "scheduler", "auto_window", "web"):
+        if not isinstance(candidate.get(section), dict):
+            raise ValidationError(f"{section} 必须是对象")
+    cf, probe, web = candidate["cloudflare"], candidate["probe"], candidate["web"]
+    cf["api_token"] = text_value(cf.get("api_token", ""), "api_token", allow_empty=True)
+    cf["zone_id"] = text_value(cf.get("zone_id", ""), "zone_id", 32, allow_empty=True)
+    if cf["zone_id"] and not re.fullmatch(r"[a-fA-F0-9]{32}", cf["zone_id"]):
+        raise ValidationError("zone_id 必须是 32 位十六进制标识")
+    cf["record_name"] = hostname(cf.get("record_name"), "record_name", allow_ip=False)
+    if cf.get("record_type") not in ("A", "CNAME"):
+        raise ValidationError("record_type 仅支持 A / CNAME")
+    if candidate.get("mode") not in ("failover", "round_robin", "weighted"):
+        raise ValidationError("mode 非法")
+    if candidate["mode"] == "round_robin" and cf["record_type"] != "A":
+        raise ValidationError("round_robin 需要主域名使用 A 记录")
+    for key, low, high in (("interval_seconds", 10, 86400), ("timeout_seconds", 3, 60), ("fail_threshold", 1, 10)):
+        probe[key] = int_value(probe.get(key), key, low, high)
+    probe["record_ttl"] = int_value(probe.get("record_ttl"), "record_ttl", 1, 86400)
+    if probe["record_ttl"] != 1 and probe["record_ttl"] < 60:
+        raise ValidationError("record_ttl 必须为 1（自动）或 60..86400")
+    if probe.get("decision_mode") not in ("smart", "api_only", "tcp_only"):
+        raise ValidationError("decision_mode 非法")
+    probe["api_url"] = validate_api_url(probe.get("api_url"))
+    candidate["scheduler"]["slice_seconds"] = int_value(candidate["scheduler"].get("slice_seconds"), "slice_seconds", 30, 86400)
+    for key in ("auto_switch", "dry_run"):
+        candidate[key] = bool_value(candidate.get(key), key)
+    window = candidate["auto_window"]
+    window["enabled"] = bool_value(window.get("enabled"), "auto_window.enabled")
+    for key in ("start", "end"):
+        if not isinstance(window.get(key), str) or not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", window[key]):
+            raise ValidationError(f"auto_window.{key} 必须为 HH:MM")
+    candidate["cooldown_minutes"] = int_value(candidate.get("cooldown_minutes", 0), "cooldown_minutes", 0, 1440)
+    nodes = candidate.get("nodes")
+    if not isinstance(nodes, list) or len(nodes) > 200:
+        raise ValidationError("nodes 必须是列表且最多 200 个节点")
+    seen = set()
+    for node in nodes:
+        if not isinstance(node, dict):
+            raise ValidationError("节点必须是对象")
+        node["target"] = hostname(node.get("target"))
+        if node["target"] in seen:
+            raise ValidationError("节点 target 重复")
+        seen.add(node["target"])
+        node["name"] = text_value(node.get("name", node["target"]), "name", 80)
+        node["port"] = int_value(node.get("port", 443), "port", 1, 65535)
+        node["weight"] = int_value(node.get("weight", 1), "weight", 1, 1000)
+        node["enabled"] = bool_value(node.get("enabled", True), "enabled")
+    web["password"] = text_value(web.get("password", ""), "password", 1024, allow_empty=True)
+    web["secret"] = text_value(web.get("secret", ""), "secret", 4096, allow_empty=True)
+    web["host"] = text_value(web.get("host", "0.0.0.0"), "web.host", 253)
+    web["port"] = int_value(web.get("port", 8787), "web.port", 1, 65535)
+    if "cookie_secure" in web:
+        web["cookie_secure"] = bool_value(web["cookie_secure"], "web.cookie_secure")
+    return candidate
+
+
+def atomic_json_write(path, payload):
+    directory = os.path.dirname(os.path.abspath(path))
+    descriptor, temporary = tempfile.mkstemp(prefix=".gtm-", suffix=".tmp", dir=directory)
+    try:
+        mode = stat.S_IMODE(os.stat(path).st_mode) if os.path.exists(path) else 0o600
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            descriptor = None
+            json.dump(payload, stream, ensure_ascii=False, indent=2, allow_nan=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+        # 目录 fsync 在 Windows 等系统不可用；replace 完成后不能再宣称提交失败。
+        try:
+            directory_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            pass
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def save_config(candidate=None) -> None:
+    with persistence_lock:
+        if candidate is None:
+            with lock:
+                candidate = copy.deepcopy(config)
+        atomic_json_write(CONFIG_PATH, candidate)
+
+
+def save_state() -> bool:
+    try:
+        with persistence_lock:
+            with lock:
+                payload = copy.deepcopy(state)
+            atomic_json_write(STATE_PATH, payload)
+        return True
+    except (OSError, ValueError, TypeError):
+        log("状态文件保存失败，已保留旧文件", "error")
+        return False
+
+
+def dns_scope(candidate=None):
+    cf = (candidate or config)["cloudflare"]
+    return "|".join((cf.get("zone_id", ""), cf.get("record_name", ""), cf.get("record_type", "")))
+
+
+def commit_config(candidate):
+    global config, _config_revision
+    candidate = validate_config(candidate)
+    with operation_lock:
+        with lock:
+            previous = config
+            old_scope = dns_scope(previous) if previous else ""
+        save_config(candidate)
+        with lock:
+            config = candidate
+            _config_revision += 1
+            scope_changed = old_scope != dns_scope(candidate)
+            context_changed = scope_changed or any(previous.get(k) != candidate.get(k) for k in ("mode", "dry_run"))
+            if context_changed:
+                state.update(current="", current_target="", record_id="", records={}, dns_records=[],
+                             cf_loaded=False, cf_error="", unmanaged_records=[], simulation={}, cf_observed_at="", cf_stale=True)
+                state["last_switch_ts"] = 0
+            if scope_changed:
+                state["owned_records"] = {}
+            state["dns_scope"] = dns_scope(candidate)
+            state["weighted"] = {"acc": {}, "last_slice": 0}
+            valid_targets = {n["target"] for n in candidate["nodes"]}
+            state["nodes"] = {t: value for t, value in state["nodes"].items() if t in valid_targets}
+            if any(previous.get("probe", {}).get(key) != candidate["probe"][key]
+                   for key in ("decision_mode", "api_url", "timeout_seconds", "fail_threshold")):
+                state["nodes"] = {}
+            previous_nodes = {node["target"]: node for node in previous.get("nodes", [])}
+            for node in candidate["nodes"]:
+                old = previous_nodes.get(node["target"])
+                if old is None or old.get("port", 443) != node["port"]:
+                    state["nodes"].pop(node["target"], None)
+        app.secret_key = candidate["web"]["secret"]
+        app.config["SESSION_COOKIE_SECURE"] = candidate["web"].get("cookie_secure", False)
+    return candidate
+
+
+def load_config() -> None:
+    global config, _config_revision
+    exists = os.path.exists(CONFIG_PATH)
+    if exists:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as stream:
+            loaded = json.load(stream)
+        if not isinstance(loaded, dict):
+            raise ValidationError("配置文件必须是对象")
+        candidate = deep_merge(DEFAULT_CONFIG, loaded)
+    else:
+        candidate = copy.deepcopy(DEFAULT_CONFIG)
+    needs_save = not exists
+    if not isinstance(candidate.get("web"), dict):
+        raise ValidationError("web 必须是对象")
+    for key in ("password", "secret"):
+        if not candidate.get("web", {}).get(key):
+            candidate.setdefault("web", {})[key] = secrets.token_urlsafe(24)
+            needs_save = True
+    candidate = validate_config(candidate)
+    if needs_save:
+        save_config(candidate)
+    with lock:
+        config = candidate
+        _config_revision += 1
+        state.update(current="", current_target="", record_id="", records={}, dns_records=[], nodes={},
+                     cf_loaded=False, cf_error="", cf_stale=True, cf_observed_at="", owned_records={},
+                     unmanaged_records=[], simulation={}, weighted={"acc": {}, "last_slice": 0},
+                     last_switch_ts=0, dns_scope=dns_scope(candidate))
+    # 旧 DNS 内容不能从配置或磁盘状态臆造；只恢复带作用域的显式所有权。
+    if os.path.exists(STATE_PATH):
+        try:
+            with open(STATE_PATH, "r", encoding="utf-8") as stream:
+                saved = json.load(stream)
+            if isinstance(saved, dict):
+                with lock:
+                    entries = saved.get("logs", [])
+                    if isinstance(entries, list):
+                        state["logs"] = [{"ts": str(item.get("ts", ""))[:32],
+                                          "level": item.get("level") if item.get("level") in ("info", "warn", "error") else "info",
+                                          "msg": safe_error(item.get("msg", ""))}
+                                         for item in entries[:200] if isinstance(item, dict)]
+                    previous_nodes = saved.get("nodes", {})
+                    if isinstance(previous_nodes, dict):
+                        for node in candidate["nodes"]:
+                            previous = previous_nodes.get(node["target"])
+                            if isinstance(previous, dict):
+                                state["nodes"][node["target"]] = {
+                                    "healthy": None, "fail": 0, "succ": 0, "api": {}, "tcp": {},
+                                    "last_check": "", "pending_refresh": True,
+                                    "previous_check": str(previous.get("last_check", ""))[:32],
+                                    "previous_healthy": previous.get("healthy") if isinstance(previous.get("healthy"), bool) else None,
+                                }
+                                # 历史地址仅用于关联已从 CF 读取的记录、等待失败阈值，不能用于新建。
+                                try:
+                                    previous_ip = str(ipaddress.IPv4Address(previous.get("last_ip") or previous.get("ip")))
+                                except (ValueError, TypeError):
+                                    previous_ip = None
+                                state["nodes"][node["target"]]["last_ip"] = previous_ip
+                    last_switch = saved.get("last_switch_ts", 0)
+                    if (saved.get("dns_scope", dns_scope(candidate)) == dns_scope(candidate)
+                            and not isinstance(last_switch, bool) and isinstance(last_switch, (int, float))
+                            and math.isfinite(last_switch) and 0 <= last_switch <= time.time()):
+                        state["last_switch_ts"] = last_switch
+                if saved.get("dns_scope") == dns_scope(candidate):
+                    owned = saved.get("owned_records", {})
+                    if isinstance(owned, dict):
+                        with lock:
+                            state["owned_records"] = {rid: {"ip": item["ip"]} for rid, item in owned.items()
+                                                      if isinstance(rid, str) and isinstance(item, dict)
+                                                      and isinstance(item.get("ip"), str)}
+        except (OSError, ValueError, TypeError):
+            log("忽略损坏的状态文件；当前解析将重新向 Cloudflare 查询", "warn")
 
 
 def masked_token() -> str:
     tok = config["cloudflare"].get("api_token", "")
-    if not tok:
-        return ""
-    return tok[:6] + "..." + tok[-4:] if len(tok) > 12 else "***"
-
+    return (tok[:6] + "..." + tok[-4:]) if len(tok) > 12 else ("***" if tok else "")
 
 # ---------------------------------------------------------------- Cloudflare
 
+
 def cf_headers() -> dict:
-    return {
-        "Authorization": f"Bearer {config['cloudflare'].get('api_token', '')}",
-        "Content-Type": "application/json",
-    }
+    return {"Authorization": f"Bearer {config['cloudflare'].get('api_token', '')}", "Content-Type": "application/json"}
 
 
-def cf_list_records(rtype: str = None):
+def cf_request(method, suffix="", **kwargs):
     cf = config["cloudflare"]
     if not cf.get("api_token") or not cf.get("zone_id"):
         raise RuntimeError("未配置 api_token / zone_id")
-    params = {"name": cf.get("record_name", "")}
+    try:
+        response = requests.request(method, f"{CF_API}/zones/{cf['zone_id']}/dns_records{suffix}",
+                                    headers=cf_headers(), timeout=15, **kwargs)
+        response.raise_for_status()
+        body = response.json()
+    except requests.RequestException as error:
+        raise RuntimeError(f"Cloudflare 请求失败（{type(error).__name__}）") from None
+    except (ValueError, TypeError):
+        raise RuntimeError("Cloudflare 返回了无效 JSON") from None
+    if not isinstance(body, dict) or body.get("success") is not True:
+        errors = body.get("errors", []) if isinstance(body, dict) else []
+        details = "; ".join(str(item.get("message", "请求失败")) for item in errors[:3] if isinstance(item, dict)) if isinstance(errors, list) else ""
+        raise RuntimeError(safe_error("Cloudflare 操作失败" + (f"：{details}" if details else "")))
+    return body
+
+
+def cf_list_records(rtype: str = None):
+    params = {"name": config["cloudflare"]["record_name"], "per_page": 100, "page": 1}
     if rtype:
         params["type"] = rtype
-    r = requests.get(
-        f"{CF_API}/zones/{cf['zone_id']}/dns_records",
-        headers=cf_headers(), params=params, timeout=15,
-    )
-    j = r.json()
-    if not j.get("success"):
-        raise RuntimeError(f"Cloudflare 查询失败: {j.get('errors')}")
-    return j.get("result") or []
+    output = []
+    seen_ids = set()
+    while True:
+        body = cf_request("GET", params=dict(params))
+        rows = body.get("result")
+        if not isinstance(rows, list):
+            raise RuntimeError("Cloudflare 记录列表格式非法")
+        for record in rows:
+            if not isinstance(record, dict) or not isinstance(record.get("id"), str) or not record["id"]:
+                raise RuntimeError("Cloudflare 记录缺少有效 id")
+            if not isinstance(record.get("content"), str) or not isinstance(record.get("type"), str):
+                raise RuntimeError("Cloudflare 记录格式非法")
+            # 即使远端筛选异常，也不把其他名称/类型的记录交给写操作。
+            if str(record.get("name", "")).lower().rstrip(".") != params["name"]:
+                raise RuntimeError("Cloudflare 返回了其他名称的记录，已拒绝操作")
+            if rtype and record["type"] != rtype:
+                raise RuntimeError("Cloudflare 返回了其他类型的记录，已拒绝操作")
+            if record["id"] in seen_ids:
+                raise RuntimeError("Cloudflare 分页包含重复记录，已拒绝不完整结果")
+            seen_ids.add(record["id"])
+            output.append(record)
+        info = body.get("result_info") or {}
+        if not isinstance(info, dict):
+            raise RuntimeError("Cloudflare 分页信息非法")
+        if "total_pages" not in info and len(rows) >= params["per_page"]:
+            raise RuntimeError("Cloudflare 未提供完整分页信息，已拒绝不完整结果")
+        total_pages = info.get("total_pages", 1)
+        if (isinstance(total_pages, bool) or not isinstance(total_pages, int) or not 0 <= total_pages <= 1000
+                or (total_pages == 0 and (rows or params["page"] != 1))):
+            raise RuntimeError("Cloudflare 分页信息非法")
+        if params["page"] >= total_pages:
+            total_count = info.get("total_count", len(output))
+            if isinstance(total_count, bool) or not isinstance(total_count, int) or total_count != len(output):
+                raise RuntimeError("Cloudflare 分页记录数不一致，已拒绝不完整结果")
+            return output
+        params["page"] += 1
+
+
+def _record_result(body, rtype=None, content=None, record_id=None):
+    result = body.get("result")
+    if not isinstance(result, dict) or not isinstance(result.get("id"), str) or not result["id"]:
+        raise RuntimeError("Cloudflare 未返回有效记录，不能确认操作成功")
+    if record_id is not None and result["id"] != record_id:
+        raise RuntimeError("Cloudflare 返回的记录 id 不匹配")
+    if rtype and result.get("type") != rtype:
+        raise RuntimeError("Cloudflare 返回的记录类型不匹配")
+    if rtype and str(result.get("name", "")).lower().rstrip(".") != config["cloudflare"]["record_name"]:
+        raise RuntimeError("Cloudflare 返回的记录名称不匹配")
+    if content is not None and str(result.get("content", "")).lower().rstrip(".") != content.lower().rstrip("."):
+        raise RuntimeError("Cloudflare 未确认期望的记录内容")
+    return result
+
+
+def _dns_content(rtype, content):
+    if rtype not in ("A", "CNAME"):
+        raise RuntimeError("仅支持写入 A / CNAME 记录")
+    if rtype == "A":
+        try:
+            return str(ipaddress.IPv4Address(content))
+        except (ipaddress.AddressValueError, TypeError):
+            raise RuntimeError("A 记录 content 必须是有效 IPv4 地址") from None
+    return hostname(content, "CNAME 目标", allow_ip=False)
 
 
 def cf_create_record(rtype: str, content: str) -> str:
-    cf = config["cloudflare"]
-    payload = {
-        "type": rtype,
-        "name": cf["record_name"],
-        "content": content,
-        "ttl": int(config["probe"].get("record_ttl", 60)),
-        "proxied": False,
-    }
-    r = requests.post(
-        f"{CF_API}/zones/{cf['zone_id']}/dns_records",
-        headers=cf_headers(), json=payload, timeout=15,
-    )
-    j = r.json()
-    if not j.get("success"):
-        raise RuntimeError(f"Cloudflare 创建失败: {j.get('errors')}")
-    return j["result"]["id"]
+    if config.get("dry_run"):
+        raise RuntimeError("DRY-RUN 禁止执行真实 DNS 写操作")
+    content = _dns_content(rtype, content)
+    payload = {"type": rtype, "name": config["cloudflare"]["record_name"], "content": content,
+               "ttl": config["probe"]["record_ttl"], "proxied": False}
+    return _record_result(cf_request("POST", json=payload), rtype, content)["id"]
 
 
 def cf_update_record(record_id: str, content: str) -> None:
-    cf = config["cloudflare"]
-    r = requests.patch(
-        f"{CF_API}/zones/{cf['zone_id']}/dns_records/{record_id}",
-        headers=cf_headers(), json={"content": content}, timeout=15,
-    )
-    j = r.json()
-    if not j.get("success"):
-        raise RuntimeError(f"Cloudflare 更新失败: {j.get('errors')}")
+    if config.get("dry_run"):
+        raise RuntimeError("DRY-RUN 禁止执行真实 DNS 写操作")
+    content = _dns_content(config["cloudflare"]["record_type"], content)
+    _record_result(cf_request("PATCH", f"/{record_id}", json={"content": content, "ttl": config["probe"]["record_ttl"]}),
+                   config["cloudflare"]["record_type"], content, record_id)
 
 
 def cf_delete_record(record_id: str) -> None:
-    cf = config["cloudflare"]
-    r = requests.delete(
-        f"{CF_API}/zones/{cf['zone_id']}/dns_records/{record_id}",
-        headers=cf_headers(), timeout=15,
-    )
-    j = r.json()
-    if not j.get("success"):
-        raise RuntimeError(f"Cloudflare 删除失败: {j.get('errors')}")
-
-
-def cf_patch_content(content: str) -> None:
-    cf = config["cloudflare"]
-    with lock:
-        record_id = state.get("record_id")
-    if not record_id:
-        rtype = cf.get("record_type", "CNAME")
-        recs = cf_list_records(rtype) or cf_list_records()
-        if not recs:
-            raise RuntimeError(f"Cloudflare 中找不到记录 {cf.get('record_name')}")
-        rec = recs[0]
-        with lock:
-            state["record_id"] = rec["id"]
-        record_id = rec["id"]
-
-    r = requests.patch(
-        f"{CF_API}/zones/{cf['zone_id']}/dns_records/{record_id}",
-        headers=cf_headers(), json={"content": content}, timeout=15,
-    )
-    j = r.json()
-    if not j.get("success"):
-        raise RuntimeError(f"Cloudflare 修改失败: {j.get('errors')}")
-
-
-def refresh_from_cf() -> None:
-    if config.get("mode") == "round_robin":
-        init_round_robin()
-        return
-
-    cf = config["cloudflare"]
-    if not cf.get("api_token") or not cf.get("zone_id"):
-        log("未配置 Cloudflare Token/Zone，跳过读取当前解析", "warn")
-        return
-    try:
-        rtype = cf.get("record_type", "CNAME")
-        recs = cf_list_records(rtype) or cf_list_records()
-        if not recs:
-            raise RuntimeError(f"Cloudflare 中找不到记录 {cf.get('record_name')}")
-        rec = recs[0]
-        with lock:
-            state["record_id"] = rec["id"]
-            state["current"] = (rec.get("content") or "").rstrip(".")
-            state["cf_error"] = ""
-        log(f"已读取 Cloudflare 当前解析：{state['current']}")
-    except Exception as e:  # noqa: BLE001
-        with lock:
-            state["cf_error"] = str(e)
-        log(f"读取 Cloudflare 记录失败：{e}", "error")
-
-
-def init_round_robin() -> None:
     if config.get("dry_run"):
-        log("DRY-RUN 模式：跳过读取主域名 A 记录，首轮探测时模拟同步", "warn")
-        return
-    try:
-        all_recs = cf_list_records()
-        cnames = [r for r in all_recs if r["type"] == "CNAME"]
-        if cnames:
-            log(
-                f"注意：主域名存在 CNAME 记录（{cnames[0].get('content')}），"
-                f"与多 A 记录模式冲突，请先删除 CNAME 或改用 failover/weighted 模式",
-                "error",
-            )
-        a_recs = [r for r in all_recs if r["type"] == "A"]
-        mapped = {}
-        for node in config.get("nodes") or []:
-            ip = resolve_ip(node["target"])
-            if not ip:
-                continue
-            for r in a_recs:
-                if r.get("content") == ip:
-                    mapped[node["target"]] = {"id": r["id"], "ip": ip}
-                    break
-        with lock:
-            state["records"] = mapped
-            state["cf_error"] = ""
-        log(f"已加载主域名 A 记录 {len(a_recs)} 条，匹配到节点 {len(mapped)} 个")
-    except Exception as e:  # noqa: BLE001
-        with lock:
-            state["cf_error"] = str(e)
-        log(f"初始化多 A 记录失败：{e}", "error")
+        raise RuntimeError("DRY-RUN 禁止执行真实 DNS 写操作")
+    _record_result(cf_request("DELETE", f"/{record_id}"), record_id=record_id)
 
+
+def _single_record(records):
+    expected = config["cloudflare"]["record_type"]
+    conflicting = {"CNAME"} if expected == "A" else {"A", "AAAA"}
+    if any(record["type"] in conflicting for record in records):
+        raise RuntimeError("主域名存在冲突的 DNS 类型，已拒绝修改")
+    selected = [record for record in records if record["type"] == expected]
+    if len(selected) != 1:
+        raise RuntimeError(f"单记录模式要求恰好一条 {expected} 记录，实际 {len(selected)} 条；已停止修改")
+    return selected[0]
+
+
+def cf_patch_content(content: str) -> bool:
+    """基于本次远端读取决定是否写入，返回是否实际修改内容。"""
+    records = cf_list_records()
+    record = _single_record(records)
+    content = _dns_content(config["cloudflare"]["record_type"], content)
+    changed = record["content"].lower().rstrip(".") != content
+    if changed:
+        cf_update_record(record["id"], content)
+    return changed
+
+
+def _observe_records(records, ips=None):
+    mode = config["mode"]
+    nodes_cfg = config["nodes"]
+    ips = ips or {}
+    mapped = {}
+    known_ips = {}
+    a_records = [record for record in records if record["type"] == "A"]
+    with lock:
+        cached_nodes = copy.deepcopy(state["nodes"])
+        owned_ids = set(state["owned_records"])
+    for node in nodes_cfg:
+        target = node["target"]
+        cached = cached_nodes.get(target, {})
+        known_ips[target] = {ips.get(target), cached.get("ip"), cached.get("last_ip")} - {None, ""}
+        match = next((r for r in a_records if r["content"] in known_ips[target]), None)
+        if match:
+            mapped[target] = {"id": match["id"], "ip": match["content"], "owned": match["id"] in owned_ids}
+    with lock:
+        state["dns_records"] = [{key: r.get(key) for key in ("id", "type", "name", "content", "ttl", "proxied")} for r in records]
+        state["records"] = mapped
+        state["cf_loaded"] = True
+        state["cf_observed_at"] = now_str()
+        state["cf_stale"] = False
+        state["dns_scope"] = dns_scope()
+        state["unmanaged_records"] = [r["content"] for r in a_records if r["id"] not in state["owned_records"]]
+        if mode == "round_robin":
+            state["current"] = ""
+            state["record_id"] = ""
+            state["current_target"] = ""
+        else:
+            state["current"] = ""
+            state["record_id"] = ""
+            state["current_target"] = ""
+    if mode != "round_robin":
+        record = _single_record(records)
+        current = record["content"].lower().rstrip(".")
+        current_target = current if config["cloudflare"]["record_type"] == "CNAME" else ""
+        if not current_target:
+            current_target = next((n["target"] for n in nodes_cfg if current in known_ips[n["target"]]), "")
+        with lock:
+            state.update(current=current, current_target=current_target, record_id=record["id"])
+
+
+def refresh_from_cf() -> bool:
+    with operation_lock:
+        try:
+            records = cf_list_records()
+            _observe_records(records)
+            if config["mode"] == "round_robin" and any(r["type"] == "CNAME" for r in records):
+                raise RuntimeError("主域名存在 CNAME，与多 A 记录模式冲突；已停止同步")
+            with lock:
+                state["cf_error"] = ""
+            return True
+        except Exception as error:
+            with lock:
+                state["cf_error"] = safe_error(error)
+                state["cf_stale"] = True
+            log(f"读取 Cloudflare 记录失败：{safe_error(error)}", "error")
+            return False
+
+
+def init_round_robin() -> bool:
+    return refresh_from_cf()
 
 # ---------------------------------------------------------------- 健康探测
+
 
 def resolve_ip(host: str):
     try:
         infos = socket.getaddrinfo(host, None, family=socket.AF_INET, proto=socket.IPPROTO_TCP)
-        return infos[0][4][0] if infos else None
-    except socket.gaierror:
+        return str(ipaddress.IPv4Address(infos[0][4][0])) if infos else None
+    except (OSError, ValueError):
         return None
 
 
-def probe_api(target: str) -> dict:
-    url = config["probe"]["api_url"].format(target=quote(target))
-    timeout = config["probe"].get("timeout_seconds", 10)
-    t0 = time.time()
+def probe_api(target: str, probe_cfg=None) -> dict:
+    probe_cfg = probe_cfg or config["probe"]
+    url = probe_cfg["api_url"].format(target=quote(target, safe=""))
+    started = time.monotonic()
     try:
-        r = requests.get(url, timeout=timeout, headers={"User-Agent": "cf-gtm/1.2"})
-        elapsed = max(1, round((time.time() - t0) * 1000))
-        j = r.json()
-        code = j.get("code")
+        response = requests.get(url, timeout=probe_cfg["timeout_seconds"], headers={"User-Agent": f"cf-gtm/{VERSION}"})
+        response.raise_for_status()
+        body = response.json()
+        if not isinstance(body, dict):
+            raise ValueError("探测接口 JSON 不是对象")
+        elapsed = max(1, round((time.monotonic() - started) * 1000))
+        code = body.get("code")
         if code == 200:
-            data = j.get("data") or {}
-            latency = data.get("time")
+            data = body.get("data")
+            if data is None:
+                data = {}
+            if not isinstance(data, dict):
+                raise ValueError("探测接口 data 不是对象")
             try:
-                latency = round(float(str(latency).replace("ms", "").strip()))
-            except (TypeError, ValueError):
+                latency = max(0, round(float(str(data.get("time")).replace("ms", "").strip())))
+            except (ValueError, TypeError, OverflowError):
                 latency = elapsed
-            return {"status": "ok", "latency": latency, "server": data.get("server", "")}
+            return {"status": "ok", "latency": latency, "server": str(data.get("server", ""))[:100]}
         if code == -2:
             return {"status": "fail", "latency": elapsed, "error": "ping 请求失败"}
-        return {"status": "unknown", "latency": elapsed, "error": f"code={code}"}
-    except Exception as e:  # noqa: BLE001
-        return {"status": "unknown", "latency": None, "error": str(e)}
+        return {"status": "unknown", "latency": elapsed, "error": "探测接口未返回有效结论"}
+    except Exception as error:
+        return {"status": "unknown", "latency": None, "error": f"探测接口请求异常（{type(error).__name__}）"}
 
 
-def probe_tcp(target: str, port: int = 443) -> dict:
-    timeout = config["probe"].get("timeout_seconds", 10)
-    t0 = time.time()
+def probe_tcp(target: str, port: int = 443, probe_cfg=None) -> dict:
+    probe_cfg = probe_cfg or config["probe"]
+    started = time.monotonic()
+    deadline = started + probe_cfg["timeout_seconds"]
     try:
         infos = socket.getaddrinfo(target, port, proto=socket.IPPROTO_TCP)
-    except socket.gaierror as e:
-        return {"status": "unknown", "latency": None, "error": f"DNS 解析失败: {e}"}
-
-    last_err = ""
+    except OSError:
+        return {"status": "unknown", "latency": None, "error": "DNS 解析失败"}
+    last_error = "未找到可用地址"
+    seen = set()
     for family, socktype, proto, _canon, sockaddr in infos:
-        s = socket.socket(family, socktype, proto)
-        s.settimeout(timeout)
+        if (family, sockaddr) in seen:
+            continue
+        seen.add((family, sockaddr))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            last_error = "TCP 探测超时"
+            break
         try:
-            s.connect(sockaddr)
-            s.close()
-            return {"status": "ok", "latency": max(1, round((time.time() - t0) * 1000))}
-        except OSError as e:  # noqa: PERF203
-            last_err = str(e)
-            try:
-                s.close()
-            except OSError:
-                pass
-    return {
-        "status": "fail",
-        "latency": max(1, round((time.time() - t0) * 1000)),
-        "error": last_err,
-    }
+            with socket.socket(family, socktype, proto) as connection:
+                connection.settimeout(remaining)
+                connection.connect(sockaddr)
+            return {"status": "ok", "latency": max(1, round((time.monotonic() - started) * 1000))}
+        except OSError as error:
+            last_error = f"TCP 连接失败（{type(error).__name__}）"
+    return {"status": "fail", "latency": max(1, round((time.monotonic() - started) * 1000)), "error": last_error}
 
 
-def judge(node: dict) -> bool:
-    mode = config["probe"].get("decision_mode", "smart")
+def judge(node: dict, decision_mode=None) -> bool:
+    mode = decision_mode or config["probe"].get("decision_mode", "smart")
     api_ok = node.get("api", {}).get("status") == "ok"
     tcp_status = node.get("tcp", {}).get("status")
-
     if mode == "api_only":
         return api_ok
     if mode == "tcp_only":
@@ -399,444 +744,551 @@ def judge(node: dict) -> bool:
     return api_ok
 
 
-# ---------------------------------------------------------------- 切换 / 调度
-
-def in_auto_window() -> bool:
-    """自动切换生效时间段（支持跨天，例如 23:00-07:00）。"""
-    w = config.get("auto_window") or {}
-    if not w.get("enabled"):
-        return True
-    start = str(w.get("start") or "00:00")[:5]
-    end = str(w.get("end") or "23:59")[:5]
-    now = datetime.now().strftime("%H:%M")
-    if start <= end:
-        return start <= now <= end
-    return now >= start or now <= end
-
-
-def cooldown_ok() -> bool:
-    """切换冷却：距离上次切换不足 N 分钟则不再自动切换。"""
-    try:
-        minutes = int(config.get("cooldown_minutes", 0) or 0)
-    except (TypeError, ValueError):
-        minutes = 0
-    if minutes <= 0:
-        return True
-    last = state.get("last_switch_ts", 0) or 0
-    return (time.time() - last) >= minutes * 60
-
-
-def auto_allowed() -> bool:
-    return bool(config.get("auto_switch", True)) and in_auto_window() and cooldown_ok()
-
-
-def switch_to(target: str, reason: str, quiet: bool = False) -> bool:
-    with lock:
-        current = state["current"]
-    if target == current:
-        return True
-
-    if config.get("dry_run"):
-        if not quiet:
-            log(f"[DRY-RUN] 将 {current} → {target}（{reason}）", "warn")
-    else:
-        try:
-            cf_patch_content(target)
-            if not quiet:
-                log(f"已切换 {current} → {target}（{reason}）", "warn")
-        except Exception as e:  # noqa: BLE001
-            with lock:
-                state["cf_error"] = str(e)
-            log(f"切换失败：{e}", "error")
-            return False
-
-    with lock:
-        state["current"] = target
-        state["cf_error"] = ""
-        state["last_switch_ts"] = time.time()
-    save_state()
-    return True
-
-
-def node_weight(target: str) -> int:
-    for n in config.get("nodes") or []:
-        if n["target"] == target:
-            try:
-                return max(1, int(n.get("weight", 1)))
-            except (TypeError, ValueError):
-                return 1
-    return 1
-
-
-def node_enabled(target: str) -> bool:
-    """节点是否参与自动切换/轮换。"""
-    for n in config.get("nodes") or []:
-        if n["target"] == target:
-            return bool(n.get("enabled", True))
-    return True
-
-
-def weighted_next(healthy: list) -> str:
-    """平滑加权轮询：healthy = [(target, weight)]，返回下一个目标。"""
-    with lock:
-        acc = state.setdefault("weighted", {}).setdefault("acc", {})
-        total = sum(w for _, w in healthy)
-        for t, w in healthy:
-            acc[t] = acc.get(t, 0) + w
-        best = max(((t, acc.get(t, 0)) for t, _ in healthy), key=lambda x: x[1])
-        acc[best[0]] -= total
-        return best[0]
-
-
-# ---------------------------------------------------------------- round_robin
-
-def sync_round_robin(results: dict) -> None:
-    with lock:
-        records = state.setdefault("records", {})
-        snapshot = {k: dict(v) for k, v in records.items()}
-
-    healthy_count = sum(1 for r in results.values() if r.get("healthy") and r.get("ip"))
-    ops = []
-    for target, res in results.items():
-        ip = res.get("ip")
-        healthy = bool(res.get("healthy"))
-        rec = snapshot.get(target)
-        if healthy and ip:
-            if not rec:
-                ops.append(("create", target, ip))
-            elif rec.get("ip") != ip:
-                ops.append(("update", target, ip, rec.get("id")))
-        elif rec and healthy_count > 0:
-            ops.append(("delete", target, rec.get("id")))
-
-    for op in ops:
-        kind, target = op[0], op[1]
-        try:
-            if kind == "create":
-                ip = op[2]
-                if config.get("dry_run"):
-                    rid = f"dry-{abs(hash(target)) % 100000}"
-                    log(f"[DRY-RUN] 创建 A 记录 {config['cloudflare']['record_name']} -> {ip}（{target}）", "warn")
-                else:
-                    rid = cf_create_record("A", ip)
-                    log(f"创建 A 记录 -> {ip}（{target}）", "warn")
-                with lock:
-                    records[target] = {"id": rid, "ip": ip, "simulated": bool(config.get("dry_run"))}
-            elif kind == "update":
-                ip, rid = op[2], op[3]
-                if config.get("dry_run"):
-                    log(f"[DRY-RUN] 更新 A 记录 {target} -> {ip}", "warn")
-                else:
-                    cf_update_record(rid, ip)
-                    log(f"更新 A 记录 {target} -> {ip}", "warn")
-                with lock:
-                    records[target] = {"id": rid, "ip": ip, "simulated": bool(config.get("dry_run"))}
-            elif kind == "delete":
-                rid = op[2]
-                if config.get("dry_run"):
-                    log(f"[DRY-RUN] 删除 A 记录（{target}）", "warn")
-                else:
-                    cf_delete_record(rid)
-                    log(f"删除 A 记录（{target}）", "warn")
-                with lock:
-                    records.pop(target, None)
-        except Exception as e:  # noqa: BLE001
-            with lock:
-                state["cf_error"] = str(e)
-            log(f"A 记录同步失败（{target}）：{e}", "error")
-
-
-def node_sync_status(target: str, healthy, ip) -> str:
-    with lock:
-        rec = (state.get("records") or {}).get(target)
-    if healthy is None:
-        return "-"
-    if healthy and ip:
-        if not rec:
-            return "待创建"
-        if rec.get("ip") != ip:
-            return "待更新"
-        return "已同步"
-    if rec:
-        return "待删除"
-    return "已摘除"
-
-
 def node_verdict(api_status, tcp_status, icmp_ever_ok=False) -> str:
-    """
-    按国内 ping（xxapi）的结果给结论：
-      - 成功 -> 正常
-      - 失败 -> 被墙
-      - 接口异常时，才回退看 TCP
-    """
+    # 保留原展示字段；实际调度统一使用 judge() 的配置化结论。
     if api_status == "ok":
         return "正常"
     if api_status == "fail":
-        return "被墙"
+        return "国内探测失败"
     if tcp_status == "ok":
         return "正常"
     if tcp_status == "fail":
         return "异常"
     return "未知"
 
+# ---------------------------------------------------------------- 切换 / 调度
+
+
+def in_auto_window() -> bool:
+    window = config.get("auto_window") or {}
+    if not window.get("enabled"):
+        return True
+    start, end = window["start"], window["end"]
+    current_time = datetime.now().strftime("%H:%M")
+    return start <= current_time <= end if start <= end else current_time >= start or current_time <= end
+
+
+def cooldown_ok() -> bool:
+    minutes = config.get("cooldown_minutes", 0)
+    return not minutes or time.time() - state.get("last_switch_ts", 0) >= minutes * 60
+
+
+def auto_allowed() -> bool:
+    return config.get("auto_switch", True) and in_auto_window() and cooldown_ok()
+
+
+def node_weight(target: str) -> int:
+    return next((n.get("weight", 1) for n in config.get("nodes", []) if n["target"] == target), 1)
+
+
+def node_enabled(target: str) -> bool:
+    return next((n.get("enabled", True) for n in config.get("nodes", []) if n["target"] == target), False)
+
+
+def switch_to(target: str, reason: str, quiet: bool = False, manual: bool = False) -> bool:
+    with operation_lock:
+        exists = any(node["target"] == target for node in config["nodes"])
+        if not exists or (not manual and not node_enabled(target)):
+            with lock:
+                state["cf_error"] = "节点不存在或不参与自动切换"
+            return False
+        try:
+            content = target
+            if config["cloudflare"]["record_type"] == "A":
+                content = resolve_ip(target)
+                if not content:
+                    raise RuntimeError("目标节点无法解析为 IPv4，未修改 DNS")
+            content = _dns_content(config["cloudflare"]["record_type"], content)
+            if config["dry_run"]:
+                with lock:
+                    state["simulation"] = {"mode": config["mode"], "current": target, "content": content, "at": now_str(), "reason": reason}
+                if not quiet:
+                    log(f"[DRY-RUN] 计划切换至 {target}（{reason}）", "warn")
+                save_state()
+                return True
+            changed = cf_patch_content(content)
+            if not refresh_from_cf():
+                raise RuntimeError("写入后读取 Cloudflare 失败，无法确认当前解析")
+            with lock:
+                if state["current"] != content:
+                    raise RuntimeError("Cloudflare 当前解析与期望不一致")
+                state["current_target"] = target
+                state["cf_error"] = ""
+                if changed:
+                    state["last_switch_ts"] = time.time()
+            if not quiet:
+                log(f"已确认解析为 {content}（{reason}）", "warn")
+            save_state()
+            return True
+        except Exception as error:
+            with lock:
+                state["cf_error"] = safe_error(error)
+                state["cf_stale"] = True
+            log(f"切换失败：{safe_error(error)}", "error")
+            return False
+
+
+def weighted_next(healthy: list) -> str:
+    if not healthy:
+        raise ValueError("没有可调度的健康节点")
+    with lock:
+        weighted = state.setdefault("weighted", {"acc": {}, "last_slice": 0})
+        acc = weighted["acc"] = {target: weighted.get("acc", {}).get(target, 0) for target, _ in healthy}
+        total = sum(weight for _, weight in healthy)
+        for target, weight in healthy:
+            acc[target] += weight
+        best = max(healthy, key=lambda item: acc[item[0]])[0]
+        acc[best] -= total
+        return best
+
+# ---------------------------------------------------------------- round_robin
+
+
+def sync_round_robin(results: dict) -> bool:
+    with operation_lock:
+        # 所有入口均执行门控，不能靠调用者自律保证自动关闭时不写 DNS。
+        if config["mode"] != "round_robin" or not auto_allowed():
+            return True
+        enabled = {node["target"] for node in config["nodes"] if node["enabled"]}
+        desired = {result["ip"] for target, result in results.items()
+                   if target in enabled and result.get("healthy") and result.get("ip")}
+        try:
+            desired = {_dns_content("A", ip) for ip in desired}
+            if config["dry_run"]:
+                with lock:
+                    records = copy.deepcopy(state["dns_records"])
+            else:
+                records = cf_list_records()
+                _observe_records(records, {target: result.get("ip") for target, result in results.items()})
+            if any(record["type"] == "CNAME" for record in records):
+                raise RuntimeError("主域名存在 CNAME，与多 A 记录冲突，未执行修改")
+            a_records = [record for record in records if record["type"] == "A"]
+            actual_ips = {record["content"] for record in a_records}
+            # 宽限只保留远端已存在的地址，不能凭历史健康新建当前探测失败的地址。
+            for target, result in results.items():
+                cached = state["nodes"].get(target, {})
+                failures = cached.get("fail", config["probe"]["fail_threshold"])
+                if target in enabled and failures < config["probe"]["fail_threshold"]:
+                    desired.update(actual_ips.intersection({result.get("ip"), cached.get("last_ip")}))
+            if config["dry_run"]:
+                with lock:
+                    state["simulation"] = {"mode": "round_robin", "ips": sorted(desired), "at": now_str(), "keep_existing_if_empty": not bool(desired)}
+                log(f"[DRY-RUN] 计划同步 {len(desired)} 个 IPv4；真实记录保持不变", "warn")
+                return True
+            if not desired:
+                log("没有健康且启用的 IPv4 节点，保留现有 A 记录", "warn")
+                with lock:
+                    state["cf_error"] = ""
+                return True
+            changed = False
+            created_ids = set()
+            # 先补齐所有健康地址；任一创建失败即停止，不继续删除旧地址。
+            for ip in sorted(desired - actual_ips):
+                rid = cf_create_record("A", ip)
+                created_ids.add(rid)
+                with lock:
+                    state["owned_records"][rid] = {"ip": ip}
+                    state["last_switch_ts"] = time.time()
+                if not save_state():
+                    raise RuntimeError("新记录已创建，但所有权状态未能持久化；已停止后续删除")
+                actual_ips.add(ip)
+                changed = True
+                log(f"创建 A 记录 -> {ip}", "warn")
+            # 只删除本程序显式创建且内容仍匹配的记录；不接管同 IP 的未知记录。
+            owned = copy.deepcopy(state["owned_records"])
+            by_id = {record["id"]: record for record in a_records}
+            for rid, item in owned.items():
+                record = by_id.get(rid)
+                if record is None:
+                    # 本轮刚创建的记录不在起始快照中，必须保留其所有权。
+                    if rid not in created_ids:
+                        with lock:
+                            state["owned_records"].pop(rid, None)
+                    continue
+                if record["content"] != item.get("ip"):
+                    with lock:
+                        state["owned_records"].pop(rid, None)
+                    continue
+                if record["content"] not in desired:
+                    cf_delete_record(rid)
+                    with lock:
+                        state["owned_records"].pop(rid, None)
+                        state["last_switch_ts"] = time.time()
+                    changed = True
+                    log(f"删除已管理的 A 记录 -> {record['content']}", "warn")
+            if not refresh_from_cf():
+                raise RuntimeError("同步后重新读取 Cloudflare 失败，无法确认记录集合")
+            with lock:
+                if changed:
+                    state["last_switch_ts"] = time.time()
+                state["cf_error"] = ""
+            return True
+        except Exception as error:
+            with lock:
+                state["cf_error"] = safe_error(error)
+                state["cf_stale"] = True
+            log(f"A 记录同步失败：{safe_error(error)}", "error")
+            return False
+        finally:
+            save_state()
+
+
+def node_sync_status(target: str, healthy, ip) -> str:
+    if config["mode"] != "round_robin":
+        return "-"
+    with lock:
+        rec = state["records"].get(target)
+    if not node_enabled(target):
+        return "已禁用（仍有记录）" if rec else "已禁用"
+    if config["dry_run"]:
+        return "模拟（未写 DNS）"
+    if not state["cf_loaded"]:
+        return "尚未读取"
+    if healthy is None:
+        return "已有记录，待探测" if rec else "-"
+    if healthy and ip:
+        return "已同步" if rec and rec.get("ip") == ip else "待同步"
+    if rec:
+        return "待摘除" if rec.get("owned") else "保留外部记录"
+    return "已摘除"
 
 # ---------------------------------------------------------------- 主循环
 
-def probe_round() -> None:
-    nodes_cfg = list(config.get("nodes") or [])
-    if not nodes_cfg:
-        return
 
-    results = {}
-    for n in nodes_cfg:
-        target = n["target"]
-        ip = resolve_ip(target)
-        api = probe_api(target)
-        tcp = probe_tcp(target, int(n.get("port", 443)))
-        nst = {"api": api, "tcp": tcp, "ip": ip}
-        nst["verdict"] = node_verdict(api.get("status"), tcp.get("status"))
-        nst["healthy"] = nst["verdict"] == "正常"
-        results[target] = nst
+def _probe_one(node, probe_cfg):
+    target = node["target"]
+    ip = resolve_ip(target)
+    api = probe_api(target, probe_cfg)
+    tcp = probe_tcp(target, node["port"], probe_cfg)
+    result = {"api": api, "tcp": tcp, "ip": ip}
+    result["healthy"] = judge(result, probe_cfg["decision_mode"])
+    result["verdict"] = node_verdict(api.get("status"), tcp.get("status"))
+    return result
 
-    switch_target = None
-    switch_reason = ""
 
+def probe_round(_acquired=False) -> bool:
+    if not _acquired and not probe_lock.acquire(blocking=False):
+        return False
     with lock:
-        for target, r in results.items():
-            nst = state["nodes"].setdefault(target, {"fail": 0, "succ": 0, "healthy": True})
-            nst.update({
-                "api": r["api"], "tcp": r["tcp"], "ip": r["ip"],
-                "healthy": r["healthy"], "last_check": now_str(),
-            })
-            if r["healthy"]:
-                nst["fail"] = 0
-                nst["succ"] = nst.get("succ", 0) + 1
-            else:
-                nst["fail"] = nst.get("fail", 0) + 1
-                nst["succ"] = 0
-            if r["api"].get("status") == "ok":
-                nst["icmp_ever_ok"] = True
-        state["last_round"] = now_str()
-
-        mode = config.get("mode", "failover")
-        threshold = int(config["probe"].get("fail_threshold", 2))
-        current = state["current"]
-
-        if not config.get("auto_switch", True) and current in state["nodes"]:
-            cst = state["nodes"][current]
-            if (results.get(current, {}).get("verdict") != "正常") and cst.get("fail", 0) == threshold:
-                log(f"节点 {current} 异常，但自动切换已关闭，请手动处理", "warn")
-
-        if mode == "failover" and auto_allowed():
-            if current in state["nodes"]:
-                cst = state["nodes"][current]
-                if (results.get(current, {}).get("verdict") != "正常") and cst["fail"] >= threshold:
-                    candidates = [t for t in results if t != current and results[t]["verdict"] == "正常" and node_enabled(t)]
-                    if candidates:
-                        order = [n["target"] for n in (config.get("nodes") or [])]
-                        candidates.sort(key=lambda t: order.index(t) if t in order else 999)
-                        switch_target = candidates[0]
-                        switch_reason = f"{current} 连续 {cst['fail']} 次异常"
-                    else:
-                        log("所有节点均不健康，保持当前解析不变", "error")
-
-        elif mode == "weighted" and auto_allowed():
-            healthy = [(t, node_weight(t)) for t in results if results[t]["verdict"] == "正常" and node_enabled(t)]
+        state["probing"] = True
+        state["last_probe_error"] = ""
+        snapshot = copy.deepcopy(config)
+        revision = _config_revision
+    try:
+        results = {}
+        nodes_cfg = snapshot.get("nodes", [])
+        if nodes_cfg:
+            with ThreadPoolExecutor(max_workers=min(8, len(nodes_cfg)), thread_name_prefix="gtm-probe") as pool:
+                futures = {pool.submit(_probe_one, node, snapshot["probe"]): node["target"] for node in nodes_cfg}
+                for future in as_completed(futures):
+                    results[futures[future]] = future.result()
+        # 配置提交与探测结果应用串行；网络探测期间允许编辑，旧结果整轮丢弃。
+        with operation_lock:
+            with lock:
+                if revision != _config_revision:
+                    state["last_probe_error"] = "探测期间配置发生变化，已丢弃旧结果，请重新探测"
+                    return False
+                threshold = config["probe"]["fail_threshold"]
+                for node in nodes_cfg:
+                    target = node["target"]
+                    result = results[target]
+                    previous = state["nodes"].get(target, {})
+                    failures = 0 if result["healthy"] else previous.get("fail", 0) + 1
+                    effective = result["healthy"] or (previous.get("effective_healthy", previous.get("healthy", False)) and failures < threshold)
+                    result["effective_healthy"] = effective
+                    state["nodes"][target] = {
+                        **result, "fail": failures, "succ": previous.get("succ", 0) + 1 if result["healthy"] else 0,
+                        "last_ip": (result.get("ip") if result["healthy"] and result.get("ip")
+                                    else previous.get("last_ip") or previous.get("ip") or result.get("ip")),
+                        "last_check": now_str(), "icmp_ever_ok": previous.get("icmp_ever_ok", False) or result["api"].get("status") == "ok",
+                    }
+                state["last_round"] = now_str()
+            # current 只来自 Cloudflare；读取失败时禁止基于猜测调度。
+            if not config["dry_run"] and not refresh_from_cf():
+                return False
+            if config["dry_run"] and not state["cf_loaded"]:
+                refresh_from_cf()  # 允许读取真实状态，但模拟计划不覆盖它。
+            if not auto_allowed():
+                return True
+            if config["mode"] == "round_robin":
+                return sync_round_robin(results)
+            current = state.get("current_target") or state["current"]
+            if config["cloudflare"]["record_type"] == "A":
+                current = next((node["target"] for node in nodes_cfg if results[node["target"]].get("ip") == state["current"]), current)
+            healthy = [(node["target"], node["weight"]) for node in nodes_cfg if node["enabled"] and results[node["target"]]["healthy"]]
             if not healthy:
-                log("所有节点均不健康，保持当前解析不变", "error")
-            else:
-                cur_ok = results.get(current, {}).get("verdict") == "正常"
-                cur_fail = state["nodes"].get(current, {}).get("fail", 0)
-                if (not cur_ok) and cur_fail >= threshold:
-                    # 当前节点挂了：立即切到权重最高的健康节点
-                    switch_target = max(healthy, key=lambda x: x[1])[0]
-                    switch_reason = f"{current} 连续 {cur_fail} 次异常"
-                else:
-                    # 正常：到时间片就按权重轮换
-                    slice_sec = max(30, int(config.get("scheduler", {}).get("slice_seconds", 300)))
-                    now_ts = time.time()
-                    wst = state.setdefault("weighted", {"acc": {}, "last_slice": 0})
-                    if now_ts - wst.get("last_slice", 0) >= slice_sec and len(healthy) > 1:
-                        nxt = weighted_next(healthy)
-                        wst["last_slice"] = now_ts
-                        if nxt != current and results.get(nxt, {}).get("verdict") == "正常":
-                            switch_target = nxt
-                            switch_reason = "按权重轮换"
+                log("所有启用节点均不健康，保持当前解析不变", "warn")
+                return True
+            current_result = results.get(current, {})
+            unavailable = not any(node["target"] == current for node in nodes_cfg)
+            failed = not current_result.get("healthy") and state["nodes"].get(current, {}).get("fail", 0) >= threshold
+            # 自动参与开关只影响候选池；健康的手动当前节点保留原 failover 语义。
+            # 已删除或外部目标不受失败计数约束；配置本身绝不伪造 DNS 切换。
+            if unavailable or failed:
+                chosen = healthy[0][0] if config["mode"] == "failover" else max(healthy, key=lambda item: item[1])[0]
+                return switch_to(chosen, "当前节点已移除或连续探测失败")
+            if config["mode"] == "weighted":
+                # 未达失败阈值时不借时间片提前绕过故障保护。
+                if not current_result.get("healthy"):
+                    return True
+                now_ts = time.time()
+                with lock:
+                    due = now_ts - state["weighted"].get("last_slice", 0) >= config["scheduler"]["slice_seconds"]
+                    weighted_before = copy.deepcopy(state["weighted"])
+                if due:
+                    chosen = weighted_next(healthy)
+                    success = chosen == current or switch_to(chosen, "按权重轮换")
+                    with lock:
+                        if success:
+                            state["weighted"]["last_slice"] = now_ts
+                        else:
+                            state["weighted"] = weighted_before
+                    return success
+            return True
+    except Exception as error:
+        with lock:
+            state["last_probe_error"] = safe_error(error)
+        log(f"探测循环异常：{safe_error(error)}", "error")
+        return False
+    finally:
+        with lock:
+            state["probing"] = False
+        save_state()
+        probe_lock.release()
 
-        state["_pending"] = switch_target
-        state["_pending_reason"] = switch_reason
 
-    pending = None
+def request_probe():
+    if not probe_lock.acquire(blocking=False):
+        return False
     with lock:
-        pending = state.pop("_pending", None)
-        reason = state.pop("_pending_reason", "")
-
-    if config.get("mode") == "round_robin":
-        sync_round_robin(results)
-        save_state()
-    elif pending:
-        switch_to(pending, reason)
-    else:
-        save_state()
+        state["probing"] = True
+    try:
+        threading.Thread(target=probe_round, kwargs={"_acquired": True}, daemon=True, name="gtm-manual-probe").start()
+    except Exception:
+        with lock:
+            state["probing"] = False
+        probe_lock.release()
+        raise
+    return True
 
 
 def probe_loop() -> None:
-    while True:
-        try:
-            probe_round()
-        except Exception as e:  # noqa: BLE001
-            log(f"探测循环异常：{e}", "error")
-        interval = max(10, int(config["probe"].get("interval_seconds", 60)))
-        time.sleep(interval)
+    while not stop_event.is_set():
+        probe_round()
+        with lock:
+            interval = config["probe"]["interval_seconds"]
+        stop_event.wait(interval)
+
+# ---------------------------------------------------------------- Web / 会话 / CSRF
 
 
-# ---------------------------------------------------------------- Web
+def _auth_version():
+    web = config.get("web", {})
+    key = str(app.secret_key or web.get("secret", "")).encode("utf-8")
+    return hmac.new(key, (web.get("password", "") + "\0" + web.get("secret", "")).encode("utf-8"), hashlib.sha256).hexdigest()
+
 
 def _logged_in() -> bool:
-    return bool(session.get("auth"))
+    version = session.get("auth_version")
+    return (session.get("auth") is True and isinstance(version, str)
+            and secrets.compare_digest(version.encode("utf-8"), _auth_version().encode("utf-8")))
+
+
+def csrf_token():
+    token = session.get("csrf_token")
+    if not isinstance(token, str) or len(token) < 32:
+        token = secrets.token_urlsafe(32)
+        session["csrf_token"] = token
+    return token
 
 
 @app.before_request
 def _auth_hook():
     path = request.path
-    if path in ("/login", "/logout") or path.startswith("/static/"):
+    if path.startswith("/static/"):
         return None
-    if not _logged_in():
-        if path.startswith("/api/"):
-            return jsonify({"ok": False, "msg": "未登录", "login": True}), 401
+    if request.method in ("GET", "HEAD") and path in ("/tools/install-ping-api.sh", "/tools/ping_api.py"):
+        return None
+    if path != "/login" and not _logged_in():
+        if path.startswith("/api/") or path == "/logout":
+            return jsonify({"ok": False, "msg": "未登录或会话已失效", "login": True}), 401
         return redirect("/login")
+    if request.method not in ("GET", "HEAD", "OPTIONS"):
+        expected = session.get("csrf_token")
+        supplied = request.headers.get("X-CSRF-Token", "")
+        if (not isinstance(expected, str) or not supplied
+                or not secrets.compare_digest(expected.encode("utf-8"), supplied.encode("utf-8"))):
+            return jsonify({"ok": False, "msg": "安全令牌已失效，请刷新页面后重试"}), 403
     return None
+
+
+@app.after_request
+def response_headers(response):
+    if not request.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Vary"] = "Cookie"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "same-origin"
+    return response
+
+
+@app.errorhandler(ValidationError)
+def invalid_input(error):
+    return jsonify({"ok": False, "msg": safe_error(error)}), 400
+
+
+@app.errorhandler(OSError)
+def persistence_error(error):
+    log("文件保存失败，操作未提交", "error")
+    return jsonify({"ok": False, "msg": "文件保存失败，操作未提交"}), 500
+
+
+def json_body():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        raise ValidationError("请求必须为有效 JSON 对象")
+    return data
+
+
+def serialized(function):
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        with operation_lock:
+            # 排队期间可能发生密码变更；持锁后重新核实会话与 CSRF。
+            rejected = _auth_hook()
+            if rejected is not None:
+                return rejected
+            return function(*args, **kwargs)
+    return wrapped
 
 
 @app.get("/login")
 def login_page():
     if _logged_in():
         return redirect("/")
-    return Response(LOGIN_PAGE, mimetype="text/html; charset=utf-8")
+    return render_template("login.html", csrf_token=csrf_token(), asset_version=VERSION)
 
 
 @app.post("/login")
+@serialized
 def login_post():
-    data = request.get_json(silent=True) or {}
-    pwd = (data.get("password") or "").strip()
-    cur = (config.get("web") or {}).get("password", "")
-    if pwd and pwd == cur:
+    data = json_body()
+    password = text_value(data.get("password", ""), "password", 1024, allow_empty=True)
+    current = config.get("web", {}).get("password", "")
+    if password and secrets.compare_digest(password.encode("utf-8"), current.encode("utf-8")):
+        session.clear()
         session["auth"] = True
-        return jsonify({"ok": True})
+        session["auth_version"] = _auth_version()
+        return jsonify({"ok": True, "csrf_token": csrf_token()})
     return jsonify({"ok": False, "msg": "密码错误"}), 401
 
 
-@app.get("/logout")
+@app.post("/logout")
 def logout():
     session.clear()
-    return redirect("/login")
+    return jsonify({"ok": True})
+
+
+@app.get("/tools/install-ping-api.sh")
+@app.get("/tools/ping_api.py")
+def download_ping_api():
+    # 只公开两份固定源码，配置文件和任意路径均不在下载范围内。
+    filename = {"/tools/install-ping-api.sh": "install-ping-api.sh", "/tools/ping_api.py": "ping_api.py"}[request.path]
+    return send_file(os.path.join(app.root_path, "tools", filename), mimetype="text/plain", as_attachment=True, download_name=filename)
 
 
 @app.get("/")
 def index():
-    return Response(HTML_PAGE, mimetype="text/html; charset=utf-8")
+    return render_template("index.html", csrf_token=csrf_token(), asset_version=VERSION)
 
 
 def public_config() -> dict:
-    cf = config["cloudflare"]
-    return {
-        "record_name": cf.get("record_name", ""),
-        "record_type": cf.get("record_type", "CNAME"),
-        "zone_id": cf.get("zone_id", ""),
-        "api_token_masked": masked_token(),
-        "has_token": bool(cf.get("api_token")),
-        "interval_seconds": config["probe"].get("interval_seconds", 60),
-        "timeout_seconds": config["probe"].get("timeout_seconds", 10),
-        "fail_threshold": config["probe"].get("fail_threshold", 2),
-        "decision_mode": config["probe"].get("decision_mode", "smart"),
-        "api_url": config["probe"].get("api_url", ""),
-        "record_ttl": config["probe"].get("record_ttl", 60),
-        "slice_seconds": config.get("scheduler", {}).get("slice_seconds", 300),
-        "mode": config.get("mode", "failover"),
-        "dry_run": bool(config.get("dry_run")),
-        "auto_switch": bool(config.get("auto_switch")),
-        "auto_window": config.get("auto_window") or {"enabled": False, "start": "00:00", "end": "23:59"},
-        "cooldown_minutes": int(config.get("cooldown_minutes", 0) or 0),
-        "has_password": bool((config.get("web") or {}).get("password")),
-    }
+    with lock:
+        cf, probe = config["cloudflare"], config["probe"]
+        return {
+            "record_name": cf["record_name"], "record_type": cf["record_type"], "zone_id": cf["zone_id"],
+            "api_token_masked": masked_token(), "has_token": bool(cf["api_token"]),
+            **{key: probe[key] for key in ("interval_seconds", "timeout_seconds", "fail_threshold", "decision_mode", "api_url", "record_ttl")},
+            "slice_seconds": config["scheduler"]["slice_seconds"], "mode": config["mode"],
+            "dry_run": config["dry_run"], "auto_switch": config["auto_switch"],
+            "auto_window": copy.deepcopy(config["auto_window"]), "cooldown_minutes": config["cooldown_minutes"],
+            "has_password": bool(config["web"].get("password")),
+        }
 
 
 @app.get("/api/status")
 def api_status():
-    mode = config.get("mode", "failover")
     with lock:
         nodes = []
-        for n in config.get("nodes") or []:
-            nst = state["nodes"].get(n["target"], {})
+        for node in config["nodes"]:
+            target = node["target"]
+            current_state = state["nodes"].get(target, {})
+            if config["mode"] == "round_robin":
+                is_current = target in state["records"]
+            elif config["cloudflare"]["record_type"] == "A":
+                is_current = bool(state["current"] and state["current"] in (current_state.get("ip"), current_state.get("last_ip")))
+            else:
+                is_current = target == state["current"]
             nodes.append({
-                "name": n.get("name", n["target"]),
-                "target": n["target"],
-                "port": n.get("port", 443),
-                "weight": n.get("weight", 1),
-                "enabled": bool(n.get("enabled", True)),
-                "api": nst.get("api", {}),
-                "tcp": nst.get("tcp", {}),
-                "ip": nst.get("ip"),
-                "healthy": nst.get("healthy"),
-                "fail": nst.get("fail", 0),
-                "last_check": nst.get("last_check", ""),
-                "current": n["target"] == state["current"],
-                "sync": node_sync_status(n["target"], nst.get("healthy"), nst.get("ip")),
-                "verdict": node_verdict(
-                    nst.get("api", {}).get("status"),
-                    nst.get("tcp", {}).get("status"),
-                    bool(nst.get("icmp_ever_ok")),
-                ),
+                "name": node["name"], "target": target, "port": node["port"], "weight": node["weight"], "enabled": node["enabled"],
+                "api": current_state.get("api", {}), "tcp": current_state.get("tcp", {}), "ip": current_state.get("ip"),
+                "healthy": current_state.get("healthy"), "fail": current_state.get("fail", 0),
+                "last_check": current_state.get("last_check", ""), "current": is_current,
+                "sync": node_sync_status(target, current_state.get("healthy"), current_state.get("ip")),
+                "verdict": node_verdict(current_state.get("api", {}).get("status"), current_state.get("tcp", {}).get("status")),
             })
-        healthy_n = sum(1 for n in nodes if n["healthy"] is True)
         current = state["current"]
-        if mode == "round_robin":
-            current = f"轮询 {healthy_n} 个节点"
+        if config["mode"] == "round_robin":
+            count = sum(record["type"] == "A" for record in state["dns_records"])
+            current = f"轮询 {count} 条 A 记录" if state["cf_loaded"] else ""
         return jsonify({
-            "mode": mode,
-            "current": current,
-            "dry_run": bool(config.get("dry_run")),
-            "auto_switch": bool(config.get("auto_switch")),
-            "decision_mode": config["probe"].get("decision_mode", "smart"),
-            "interval": config["probe"].get("interval_seconds", 60),
-            "threshold": config["probe"].get("fail_threshold", 2),
-            "record_name": config["cloudflare"].get("record_name", ""),
-            "has_token": bool(config["cloudflare"].get("api_token")),
-            "record_type": config["cloudflare"].get("record_type", "CNAME"),
-            "cf_error": state.get("cf_error", ""),
-            "last_round": state.get("last_round", ""),
-            "nodes": nodes,
-            "logs": state["logs"][:50],
-            "config": public_config(),
+            "mode": config["mode"], "current": current, "dry_run": config["dry_run"], "auto_switch": config["auto_switch"],
+            "decision_mode": config["probe"]["decision_mode"], "interval": config["probe"]["interval_seconds"],
+            "threshold": config["probe"]["fail_threshold"], "record_name": config["cloudflare"]["record_name"],
+            "has_token": bool(config["cloudflare"]["api_token"]), "record_type": config["cloudflare"]["record_type"],
+            "cf_error": state["cf_error"], "last_round": state["last_round"], "nodes": nodes,
+            "logs": copy.deepcopy(state["logs"][:50]), "config": public_config(), "version": VERSION,
+            "probing": state["probing"], "last_probe_error": state["last_probe_error"], "cf_loaded": state["cf_loaded"],
+            "cf_observed_at": state["cf_observed_at"], "cf_stale": state["cf_stale"],
+            "dns_records": copy.deepcopy(state["dns_records"]), "unmanaged_records": list(state["unmanaged_records"]),
+            "simulation": copy.deepcopy(state["simulation"]),
         })
 
 
 @app.post("/api/probe")
+@serialized
 def api_probe():
-    threading.Thread(target=probe_round, daemon=True).start()
-    return jsonify({"ok": True})
+    json_body()
+    if not request_probe():
+        return jsonify({"ok": False, "msg": "已有探测正在执行", "probing": True}), 409
+    return jsonify({"ok": True, "probing": True})
 
 
 @app.post("/api/switch")
+@serialized
 def api_switch():
-    if config.get("mode") == "round_robin":
-        return jsonify({"ok": False, "msg": "round_robin 模式无需手动切换"}), 400
-    data = request.get_json(silent=True) or {}
-    target = (data.get("target") or "").strip()
-    if not any(n["target"] == target for n in (config.get("nodes") or [])):
-        return jsonify({"ok": False, "msg": "未知节点"}), 400
-    ok = switch_to(target, "手动切换")
-    return jsonify({"ok": ok, "current": state["current"]})
+    data = json_body()
+    if config["mode"] == "round_robin":
+        raise ValidationError("round_robin 模式无需手动切换")
+    target = hostname(data.get("target"))
+    if not any(node["target"] == target for node in config["nodes"]):
+        raise ValidationError("节点不存在")
+    ok = switch_to(target, "手动切换", manual=True)
+    return jsonify({"ok": ok, "current": state["current"], "simulated": config["dry_run"],
+                    "msg": "" if ok else state["cf_error"]}), 200 if ok else 502
 
 
 @app.post("/api/auto")
+@serialized
 def api_auto():
-    data = request.get_json(silent=True) or {}
-    with lock:
-        config["auto_switch"] = bool(data.get("enabled"))
-    save_config()
-    log(f"自动切换已{'开启' if config['auto_switch'] else '关闭'}")
-    return jsonify({"ok": True, "auto_switch": config["auto_switch"]})
+    data = json_body()
+    enabled = bool_value(data.get("enabled"), "enabled")
+    candidate = copy.deepcopy(config)
+    candidate["auto_switch"] = enabled
+    commit_config(candidate)
+    log(f"自动切换已{'开启' if enabled else '关闭'}")
+    return jsonify({"ok": True, "auto_switch": enabled})
 
 
 @app.get("/api/config")
@@ -845,901 +1297,169 @@ def api_get_config():
 
 
 @app.post("/api/config")
+@serialized
 def api_set_config():
-    data = request.get_json(silent=True) or {}
-    cf = config["cloudflare"]
-    probe = config["probe"]
-
-    if data.get("api_token") and data["api_token"] not in ("***", "已配置"):
-        cf["api_token"] = data["api_token"].strip()
-    if data.get("zone_id") is not None:
-        cf["zone_id"] = data["zone_id"].strip()
-    if data.get("record_name"):
-        cf["record_name"] = data["record_name"].strip()
-    if data.get("record_type") in ("CNAME", "A"):
-        cf["record_type"] = data["record_type"]
-
-    for key in ("interval_seconds", "fail_threshold", "record_ttl", "timeout_seconds"):
+    data = json_body()
+    candidate = copy.deepcopy(config)
+    cf, probe = candidate["cloudflare"], candidate["probe"]
+    if "api_token" in data:
+        token = text_value(data["api_token"], "api_token", allow_empty=True)
+        if token and token not in ("***", "已配置", masked_token()):
+            cf["api_token"] = token
+    for key in ("zone_id", "record_name", "record_type"):
         if key in data:
-            try:
-                val = int(data[key])
-            except (TypeError, ValueError):
-                return jsonify({"ok": False, "msg": f"{key} 非法"}), 400
-            if key == "interval_seconds":
-                probe[key] = max(10, val)
-            elif key == "fail_threshold":
-                probe[key] = max(1, min(10, val))
-            elif key == "record_ttl":
-                probe[key] = max(60, val)
-            else:
-                probe[key] = max(3, val)
-
-    if data.get("decision_mode") in ("smart", "api_only", "tcp_only"):
-        probe["decision_mode"] = data["decision_mode"]
-    if "api_url" in data:
-        url = (data.get("api_url") or "").strip()
-        if not url.startswith(("http://", "https://")):
-            return jsonify({"ok": False, "msg": "探测接口必须是 http/https 地址"}), 400
-        if "{target}" not in url:
-            return jsonify({"ok": False, "msg": "探测接口必须包含 {target} 占位符"}), 400
-        probe["api_url"] = url
-    if data.get("mode") in ("failover", "round_robin", "weighted"):
-        if data["mode"] == "round_robin" and cf.get("record_type") == "CNAME":
-            return jsonify({
-                "ok": False,
-                "msg": "round_robin 需要主域名使用 A 记录；CNAME 主域名请选 failover 或 weighted",
-            }), 400
-        config["mode"] = data["mode"]
+            cf[key] = data[key]
+    for key in ("interval_seconds", "timeout_seconds", "fail_threshold", "record_ttl", "decision_mode", "api_url"):
+        if key in data:
+            probe[key] = data[key]
+    for key in ("mode", "auto_switch", "dry_run", "cooldown_minutes"):
+        if key in data:
+            candidate[key] = data[key]
     if "slice_seconds" in data:
-        try:
-            config.setdefault("scheduler", {})["slice_seconds"] = max(30, int(data["slice_seconds"]))
-        except (TypeError, ValueError):
-            return jsonify({"ok": False, "msg": "slice_seconds 非法"}), 400
-    if "auto_switch" in data:
-        config["auto_switch"] = bool(data["auto_switch"])
-    if "dry_run" in data:
-        config["dry_run"] = bool(data["dry_run"])
-    if "auto_window" in data and isinstance(data["auto_window"], dict):
-        aw = config.setdefault("auto_window", {"enabled": False, "start": "00:00", "end": "23:59"})
-        if "enabled" in data["auto_window"]:
-            aw["enabled"] = bool(data["auto_window"]["enabled"])
-        for k in ("start", "end"):
-            if data["auto_window"].get(k):
-                aw[k] = str(data["auto_window"][k])[:5]
-    if "cooldown_minutes" in data:
-        try:
-            config["cooldown_minutes"] = max(0, min(1440, int(data["cooldown_minutes"])))
-        except (TypeError, ValueError):
-            return jsonify({"ok": False, "msg": "cooldown_minutes 非法"}), 400
-
-    save_config()
+        candidate["scheduler"]["slice_seconds"] = data["slice_seconds"]
+    if "auto_window" in data:
+        if not isinstance(data["auto_window"], dict):
+            raise ValidationError("auto_window 必须是对象")
+        candidate["auto_window"].update(data["auto_window"])
+    commit_config(candidate)
     log("配置已更新")
     return jsonify({"ok": True, "config": public_config()})
 
 
 @app.post("/api/password")
+@serialized
 def api_password():
-    data = request.get_json(silent=True) or {}
-    old = (data.get("old") or "").strip()
-    new = (data.get("new") or "").strip()
-    cur = (config.get("web") or {}).get("password", "")
-    if cur and old != cur:
-        return jsonify({"ok": False, "msg": "当前密码不正确"}), 400
+    data = json_body()
+    old = text_value(data.get("old", ""), "old", 1024, allow_empty=True)
+    new = text_value(data.get("new", ""), "new", 1024, allow_empty=True)
+    if not secrets.compare_digest(old.encode("utf-8"), config["web"]["password"].encode("utf-8")):
+        raise ValidationError("当前密码不正确")
     if len(new) < 6:
-        return jsonify({"ok": False, "msg": "新密码至少 6 位"}), 400
-    config.setdefault("web", {})["password"] = new
-    save_config()
-    log("面板密码已更新")
+        raise ValidationError("新密码至少 6 位")
+    candidate = copy.deepcopy(config)
+    candidate["web"]["password"] = new
+    commit_config(candidate)
+    # 当前客户端续签，其他已经签名的旧密码会话全部失效。
+    session["auth_version"] = _auth_version()
+    log("面板密码已更新，其他会话已失效")
     return jsonify({"ok": True})
 
 
 @app.post("/api/test_cf")
+@serialized
 def api_test_cf():
+    json_body()
     try:
-        rtype = config["cloudflare"].get("record_type", "CNAME")
-        recs = cf_list_records(rtype) or cf_list_records()
-        return jsonify({
-            "ok": True,
-            "count": len(recs),
-            "records": [
-                {"type": r.get("type"), "content": r.get("content"), "ttl": r.get("ttl")}
-                for r in recs
-            ],
-        })
-    except Exception as e:  # noqa: BLE001
-        return jsonify({"ok": False, "msg": str(e)})
+        records = cf_list_records()
+        _observe_records(records)
+        if config["mode"] == "round_robin" and any(record["type"] == "CNAME" for record in records):
+            raise RuntimeError("主域名存在 CNAME，与多 A 模式冲突")
+        with lock:
+            state["cf_error"] = ""
+        return jsonify({"ok": True, "count": len(records), "records": [
+            {"type": r["type"], "content": r["content"], "ttl": r.get("ttl")} for r in records]})
+    except Exception as error:
+        with lock:
+            state["cf_error"] = safe_error(error)
+            state["cf_stale"] = True
+        return jsonify({"ok": False, "msg": safe_error(error)}), 502
 
 
 @app.post("/api/nodes")
+@serialized
 def api_add_node():
-    data = request.get_json(silent=True) or {}
-    target = (data.get("target") or "").strip()
-    if not target:
-        return jsonify({"ok": False, "msg": "缺少域名"}), 400
-    if any(n["target"] == target for n in config["nodes"]):
-        return jsonify({"ok": False, "msg": "节点已存在"}), 400
-    try:
-        port = int(data.get("port") or 443)
-        weight = max(1, int(data.get("weight") or 1))
-    except (TypeError, ValueError):
-        return jsonify({"ok": False, "msg": "端口/权重非法"}), 400
-    config["nodes"].append({
-        "name": (data.get("name") or target).strip(),
-        "target": target,
-        "port": port,
-        "weight": weight,
-        "enabled": bool(data.get("enabled", True)),
-    })
-    save_config()
-    log(f"添加节点 {target}（端口 {port}，权重 {weight}）")
+    data = json_body()
+    target = hostname(data.get("target"))
+    candidate = copy.deepcopy(config)
+    name = data.get("name", target)
+    if name == "":
+        name = target
+    candidate["nodes"].append({"name": name, "target": target,
+                               "port": data.get("port", 443), "weight": data.get("weight", 1), "enabled": data.get("enabled", True)})
+    commit_config(candidate)
+    log(f"添加节点 {target}")
     return jsonify({"ok": True})
 
 
 @app.post("/api/nodes/reorder")
+@serialized
 def api_reorder_nodes():
-    data = request.get_json(silent=True) or {}
-    order = [t for t in (data.get("order") or []) if isinstance(t, str)]
-    by_target = {n["target"]: n for n in (config.get("nodes") or [])}
-    new_nodes = [by_target[t] for t in order if t in by_target]
-    for n in (config.get("nodes") or []):
-        if n not in new_nodes:
-            new_nodes.append(n)
-    config["nodes"] = new_nodes
-    save_config()
-    log("节点顺序已更新：" + " → ".join(n["target"] for n in new_nodes))
+    data = json_body()
+    order = data.get("order")
+    if not isinstance(order, list) or not all(isinstance(target, str) for target in order):
+        raise ValidationError("order 必须是 target 字符串列表")
+    candidate = copy.deepcopy(config)
+    by_target = {node["target"]: node for node in candidate["nodes"]}
+    normalized = [hostname(target) for target in order]
+    if any(target not in by_target for target in normalized):
+        raise ValidationError("order 包含未知节点")
+    seen = set()
+    ordered = []
+    for target in normalized + list(by_target):
+        if target not in seen:
+            seen.add(target)
+            ordered.append(by_target[target])
+    candidate["nodes"] = ordered
+    commit_config(candidate)
+    log("节点顺序已更新")
     return jsonify({"ok": True})
 
 
 @app.delete("/api/nodes")
+@serialized
 def api_del_node():
-    target = (request.args.get("target") or "").strip()
-    config["nodes"] = [n for n in config["nodes"] if n["target"] != target]
-    with lock:
-        state["nodes"].pop(target, None)
-        state.get("records", {}).pop(target, None)
-        if state["current"] == target:
-            state["current"] = config["nodes"][0]["target"] if config["nodes"] else ""
-    save_config()
-    log(f"删除节点 {target}")
+    target = hostname(request.args.get("target"))
+    if not any(node["target"] == target for node in config["nodes"]):
+        return jsonify({"ok": False, "msg": "节点不存在"}), 404
+    candidate = copy.deepcopy(config)
+    candidate["nodes"] = [node for node in candidate["nodes"] if node["target"] != target]
+    commit_config(candidate)
+    # current 与 owned_records 必须保留；前者仍是真实解析，后者供后续安全清理。
+    log(f"删除节点 {target}；真实 DNS 将按自动调度设置处理")
     return jsonify({"ok": True})
 
 
 @app.post("/api/nodes/update")
+@serialized
 def api_update_node():
-    data = request.get_json(silent=True) or {}
-    target = (data.get("target") or "").strip()
-    for n in config["nodes"]:
-        if n["target"] == target:
-            if data.get("name"):
-                n["name"] = data["name"].strip()
-            if "port" in data:
-                try:
-                    n["port"] = int(data["port"])
-                except (TypeError, ValueError):
-                    return jsonify({"ok": False, "msg": "端口非法"}), 400
-            if "weight" in data:
-                try:
-                    n["weight"] = max(1, int(data["weight"]))
-                except (TypeError, ValueError):
-                    return jsonify({"ok": False, "msg": "权重非法"}), 400
-            if "enabled" in data:
-                n["enabled"] = bool(data["enabled"])
-            save_config()
-            return jsonify({"ok": True})
-    return jsonify({"ok": False, "msg": "节点不存在"}), 404
-
-
-HTML_PAGE = r"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CF-GTM · 流量调度控制台</title>
-<style>
-:root{
-  --bg:#0b1220;--panel:#121c2e;--panel2:#0f1828;--line:#22314b;
-  --txt:#e6edf7;--dim:#8ba0bf;--ok:#22c55e;--bad:#ef4444;--warn:#f59e0b;--acc:#3b82f6;
-}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--txt);
-  font:14px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
-.wrap{max-width:1240px;margin:0 auto;padding:24px 18px 60px}
-header{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-bottom:22px}
-h1{font-size:20px;margin:0;letter-spacing:.5px}
-h1 span{color:var(--acc)}
-.sub{color:var(--dim);font-size:12px;margin-top:2px}
-.badge{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;
-  font-size:12px;border:1px solid var(--line);background:var(--panel2);color:var(--dim)}
-.badge.ok{color:var(--ok);border-color:rgba(34,197,94,.35);background:rgba(34,197,94,.08)}
-.badge.bad{color:var(--bad);border-color:rgba(239,68,68,.35);background:rgba(239,68,68,.08)}
-.badge.warn{color:var(--warn);border-color:rgba(245,158,11,.35);background:rgba(245,158,11,.08)}
-.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px}
-@media(max-width:900px){.cards{grid-template-columns:repeat(2,1fr)}}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
-.card .k{color:var(--dim);font-size:12px;margin-bottom:6px}
-.card .v{font-size:18px;font-weight:600;word-break:break-all}
-.card .v.small{font-size:14px;font-weight:500}
-.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;margin-bottom:16px;overflow:hidden}
-.panel .ph{display:flex;align-items:center;justify-content:space-between;gap:10px;
-  padding:13px 16px;border-bottom:1px solid var(--line);flex-wrap:wrap}
-.panel .ph b{font-size:14px}
-.panel .pb{padding:14px 16px}
-table{width:100%;border-collapse:collapse;font-size:13px}
-th{color:var(--dim);font-weight:500;text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
-td{padding:10px;border-bottom:1px solid rgba(34,49,75,.55);vertical-align:middle}
-tr:last-child td{border-bottom:none}
-tr.cur td{background:rgba(59,130,246,.07)}
-.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:middle}
-.dot.ok{background:var(--ok);box-shadow:0 0 8px rgba(34,197,94,.6)}
-.dot.bad{background:var(--bad);box-shadow:0 0 8px rgba(239,68,68,.6)}
-.dot.unk{background:var(--warn)}
-.mono{font-family:ui-monospace,Consolas,"SFMono-Regular",monospace;font-size:12px;color:var(--dim)}
-button{cursor:pointer;border:1px solid var(--line);background:var(--panel2);color:var(--txt);
-  border-radius:8px;padding:6px 12px;font-size:12px;transition:.15s}
-button:hover{border-color:var(--acc);color:#fff}
-button.primary{background:var(--acc);border-color:var(--acc);color:#fff}
-button.danger{border-color:rgba(239,68,68,.4);color:var(--bad)}
-button.danger:hover{background:rgba(239,68,68,.12)}
-button:disabled{opacity:.45;cursor:not-allowed}
-.switch{position:relative;display:inline-block;width:40px;height:22px;vertical-align:middle}
-.switch.mini{width:34px;height:18px}
-.switch.mini .slider:before{width:12px;height:12px;left:3px;top:3px}
-.switch.mini input:checked+.slider:before{transform:translateX(16px)}
-.switch input{opacity:0;width:0;height:0}
-.slider{position:absolute;inset:0;background:#2a3a55;border-radius:22px;transition:.2s;cursor:pointer}
-.slider:before{content:"";position:absolute;width:16px;height:16px;left:3px;top:3px;
-  background:#fff;border-radius:50%;transition:.2s}
-input:checked+.slider{background:var(--ok)}
-input:checked+.slider:before{transform:translateX(18px)}
-.logs{max-height:300px;overflow:auto;font-family:ui-monospace,Consolas,monospace;font-size:12px}
-.log{display:flex;gap:10px;padding:5px 0;border-bottom:1px dashed rgba(34,49,75,.6)}
-.log .t{color:var(--dim);white-space:nowrap}
-.log .m.info{color:#c8d6ea}
-.log .m.warn{color:var(--warn)}
-.log .m.error{color:var(--bad)}
-footer{color:var(--dim);font-size:12px;text-align:center;margin-top:30px}
-footer a,.sub a{color:var(--acc);text-decoration:none}
-footer a:hover,.sub a:hover{text-decoration:underline}
-.modal{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:100;padding:16px}
-.modal-card{background:var(--panel);border:1px solid var(--line);border-radius:14px;
-  width:min(680px,94vw);max-height:90vh;overflow:auto;overflow-x:hidden;box-shadow:0 20px 60px rgba(0,0,0,.5)}
-.modal-head{display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid var(--line)}
-.modal-body{padding:16px 18px;overflow-x:hidden}
-.modal .field{min-width:0}
-.modal .field input,.modal .field select{width:100%}
-.modal .field label{white-space:normal;line-height:1.45}
-@media(max-width:720px){
-  .modal-card{width:96vw;border-radius:12px}
-  .modal-head{padding:12px 14px}
-  .modal-body{padding:14px}
-  .modal .grid2,.modal .grid3{grid-template-columns:1fr}
-  .wrap{padding:16px 12px 40px}
-  header h1{font-size:18px}
-}
-.toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-td.toolbar{display:table-cell;white-space:nowrap;vertical-align:middle}
-td.toolbar button,td.toolbar .badge{height:26px;display:inline-flex;align-items:center;justify-content:center;
-  padding:0 9px;line-height:1;vertical-align:middle;margin-right:4px}
-td.toolbar button:last-child{margin-right:0}
-input,select{background:var(--panel2);border:1px solid var(--line);color:var(--txt);
-  border-radius:8px;padding:7px 10px;font-size:13px;outline:none}
-input:focus,select:focus{border-color:var(--acc)}
-input.small{width:80px}
-input.mid{width:180px}
-.grid2{display:grid;grid-template-columns:repeat(2,1fr);gap:14px 20px}
-.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:14px 20px}
-@media(max-width:900px){.grid2,.grid3{grid-template-columns:1fr}}
-.field{display:flex;flex-direction:column;gap:6px}
-.field label{color:var(--dim);font-size:12px}
-.hint{color:var(--dim);font-size:12px;margin-top:6px}
-.msg{font-size:12px;margin-left:8px}
-.msg.ok{color:var(--ok)}
-.msg.bad{color:var(--bad)}
-.divider{height:1px;background:var(--line);margin:16px 0}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <header>
-    <div>
-      <h1>CF<span>-GTM</span> · 流量调度控制台</h1>
-      <div class="sub">Cloudflare DNS 自动故障切换 · 探测源：国内 ICMP + 本地 TCP · <a href="https://t.me/taohuayuang" target="_blank" rel="noopener">桃花酱出品 @taohuayuang</a></div>
-    </div>
-    <div class="toolbar">
-      <span id="modeBadge" class="badge">-</span>
-      <span id="dryBadge" class="badge warn" style="display:none">DRY-RUN 演练</span>
-      <span id="cfBadge" class="badge">CF 未连接</span>
-      <span class="badge">自动切换</span>
-      <label class="switch">
-        <input type="checkbox" id="autoSwitch" onchange="toggleAuto(this)">
-        <span class="slider"></span>
-      </label>
-      <button onclick="openDomainModal()">主域名</button>
-      <button onclick="openProbeModal()">探测设置</button>
-      <button onclick="openNodesModal()">节点管理</button>
-      <button onclick="openAutoModal()">自动切换设置</button>
-      <button onclick="openPwdModal()">安全</button>
-      <button class="primary" onclick="probeNow()">立即探测</button>
-    </div>
-  </header>
-
-  <div class="cards">
-    <div class="card"><div class="k">当前解析</div><div class="v" id="curTarget">-</div></div>
-    <div class="card"><div class="k">服务状态</div><div class="v" id="svcState">-</div></div>
-    <div class="card"><div class="k">探测频率 / 失败阈值</div><div class="v small" id="probeCfg">-</div></div>
-    <div class="card"><div class="k">最近一轮探测</div><div class="v small" id="lastRound">-</div></div>
-  </div>
-
-  <!-- 探测设置弹窗 -->
-  <div id="probeModal" class="modal" style="display:none">
-    <div class="modal-card">
-      <div class="modal-head"><b>探测与调度设置</b><button onclick="closeProbeModal()">关闭</button></div>
-      <div class="modal-body">
-        <div class="grid2">
-          <div class="field"><label>探测频率（秒）</label><input id="cfgInterval" type="number" min="10"></div>
-          <div class="field"><label>失败阈值（连续 N 次切换）</label><input id="cfgThreshold" type="number" min="1"></div>
-        </div>
-        <div class="grid2" style="margin-top:14px">
-          <div class="field"><label>调度模式</label>
-            <select id="cfgMode">
-              <option value="failover">failover · 主备切换</option>
-              <option value="weighted">weighted · 按权重轮换</option>
-              <option value="round_robin" id="rrOption">round_robin · 多 A 记录轮询（需 A 记录）</option>
-            </select>
-          </div>
-          <div class="field"><label>判定模式</label>
-            <select id="cfgDecision">
-              <option value="smart">smart（TCP 优先）</option>
-              <option value="api_only">api_only（只看国内 ping）</option>
-              <option value="tcp_only">tcp_only（只看 TCP）</option>
-            </select>
-          </div>
-        </div>
-        <div class="field" style="margin-top:14px">
-          <label>探测接口（国内）</label>
-          <input id="cfgApiUrl" placeholder="https://v2.xxapi.cn/api/ping?url={target}">
-        </div>
-        <div class="hint" style="margin-top:6px">默认用 xxapi 第三方接口。换成自己的国内服务器时，填自己的地址，用 <b>{target}</b> 占位，例如 <span class="mono">http://你的IP:8080/ping?host={target}</span>；接口返回 JSON 里 <span class="mono">code=200</span> 表示正常、<span class="mono">code=-2</span> 表示失败。</div>
-        <div class="toolbar" style="margin-top:16px">
-          <button class="primary" onclick="saveConfig()">保存设置</button>
-          <span id="cfgMsg" class="msg"></span>
-        </div>
-        <div class="hint">CNAME 主域名只能用 failover / weighted；round_robin 需要主域名改成 A 记录。weighted 模式下权重相同 = 严格轮流，权重不同 = 按比例轮换，不是随机。</div>
-      </div>
-    </div>
-  </div>
-
-  <!-- 节点管理弹窗 -->
-  <div id="nodesModal" class="modal" style="display:none">
-    <div class="modal-card">
-      <div class="modal-head"><b>节点管理</b><button onclick="closeNodesModal()">关闭</button></div>
-      <div class="modal-body">
-        <div class="grid3">
-          <div class="field"><label>名称</label><input id="nodeName" placeholder="日本A"></div>
-          <div class="field"><label>DDNS 域名 / IP</label><input id="nodeTarget" placeholder="jp1.ddns.net"></div>
-          <div class="field"><label>探测端口</label><input id="nodePort" class="small" type="number" value="443"></div>
-        </div>
-        <div class="toolbar" style="margin-top:12px">
-          <div class="field"><label>权重</label>
-            <select id="nodeWeight">
-              <option value="4">最高</option>
-              <option value="3">高</option>
-              <option value="2">中</option>
-              <option value="1" selected>低</option>
-            </select>
-          </div>
-          <div class="field"><label>自动切换</label>
-            <label style="display:flex;align-items:center;gap:6px;font-size:13px;padding-top:6px">
-              <input type="checkbox" id="nodeEnabled" checked style="width:auto"> 参与
-            </label>
-          </div>
-          <button class="primary" onclick="addNode()">添加节点</button>
-          <span id="nodeMsg" class="msg"></span>
-        </div>
-        <div class="hint">权重只在 weighted 模式下生效（最高/高/中/低 = 4/3/2/1），failover 模式忽略权重。权重仅保存在本机，不会写入 Cloudflare。</div>
-      </div>
-    </div>
-  </div>
-
-  <!-- 自动切换弹窗 -->
-  <div id="autoModal" class="modal" style="display:none">
-    <div class="modal-card">
-      <div class="modal-head"><b>自动切换设置</b><button onclick="closeAutoModal()">关闭</button></div>
-      <div class="modal-body">
-        <div class="field"><label>自动切换时间段</label>
-          <label style="display:flex;align-items:center;gap:8px;color:var(--txt);font-size:13px">
-            <input type="checkbox" id="autoWindowEnabled" style="width:auto"> 启用生效时间段限制
-          </label>
-        </div>
-        <div class="grid2" style="margin-top:14px">
-          <div class="field"><label>生效时间段（开始）</label><input id="autoStart" type="time" value="00:00"></div>
-          <div class="field"><label>生效时间段（结束）</label><input id="autoEnd" type="time" value="23:59"></div>
-        </div>
-        <div class="field" style="margin-top:14px">
-          <label>切换冷却（分钟，0 表示不限制）</label>
-          <input id="autoCooldown" type="number" min="0" value="0">
-        </div>
-        <div class="field" style="margin-top:14px">
-          <label>自动切换时间（秒）</label>
-          <input id="cfgSlice" type="number" min="30">
-        </div>
-        <div class="hint">weighted 模式下每隔这个时间按权重轮换一次解析（默认 300 秒 = 5 分钟；想 60 分钟换一次就填 3600）；failover 模式只在故障时切换，不受此限制。</div>
-        <div class="toolbar" style="margin-top:16px">
-          <button class="primary" onclick="saveAuto()">保存</button>
-          <span id="autoMsg" class="msg"></span>
-        </div>
-        <div class="hint">生效时间段支持跨天（如 23:00-07:00）；冷却期内不会再次自动切换，防止抖动来回切。</div>
-      </div>
-    </div>
-  </div>
-
-  <!-- 主域名设置弹窗 -->
-  <div id="domainModal" class="modal" style="display:none">
-    <div class="modal-card">
-      <div class="modal-head">
-        <b>主域名设置</b>
-        <button onclick="closeDomainModal()">关闭</button>
-      </div>
-      <div class="modal-body">
-        <div class="grid2">
-          <div class="field"><label>主域名（固定记录）</label><input id="cfgRecord" placeholder="main.example.com"></div>
-          <div class="field"><label>记录类型</label>
-            <select id="cfgType" onchange="syncModeOptions()"><option value="CNAME">CNAME</option><option value="A">A</option></select>
-          </div>
-        </div>
-        <div class="field" style="margin-top:14px"><label>Zone ID</label><input id="cfgZone" placeholder="32 位 Zone ID"></div>
-        <div class="field" style="margin-top:14px">
-          <label>A 记录 TTL（秒，仅 round_robin 模式使用）</label>
-          <input id="cfgTtl" type="number" min="60">
-        </div>
-        <div class="field" style="margin-top:14px">
-          <label>API Token（留空表示不修改）</label>
-          <input id="cfgToken" type="password" placeholder="已配置则留空">
-        </div>
-        <div class="toolbar" style="margin-top:16px">
-          <button class="primary" onclick="saveDomain()">保存主域名</button>
-          <button onclick="testCF()">测试 CF 连接</button>
-          <span id="domainMsg" class="msg"></span>
-        </div>
-        <div class="hint">这里不常改。Token 只保存在本机 config.json，不会外发。</div>
-      </div>
-    </div>
-  </div>
-
-  <!-- 安全设置弹窗 -->
-  <div id="pwdModal" class="modal" style="display:none">
-    <div class="modal-card">
-      <div class="modal-head"><b>面板安全</b><button onclick="closePwdModal()">关闭</button></div>
-      <div class="modal-body">
-        <div class="hint" style="margin-bottom:12px">面板已启用 HTTP Basic Auth，用户名固定 admin。改完密码后浏览器会重新要求登录。</div>
-        <div class="field"><label>当前密码</label><input id="pwdOld" type="password" placeholder="首次设置可留空"></div>
-        <div class="field" style="margin-top:12px"><label>新密码（至少 6 位）</label><input id="pwdNew" type="password"></div>
-        <div class="field" style="margin-top:12px"><label>确认新密码</label><input id="pwdConfirm" type="password"></div>
-        <div class="toolbar" style="margin-top:16px">
-          <button class="primary" onclick="savePassword()">保存密码</button>
-          <a href="/logout" style="color:var(--bad);font-size:12px;text-decoration:none;margin-left:6px">退出登录</a>
-          <span id="pwdMsg" class="msg"></span>
-        </div>
-        <div class="hint">Basic Auth 是明文传输，公网部署建议再加一层 HTTPS（Nginx / Caddy），或者只允许内网访问。</div>
-      </div>
-    </div>
-  </div>
-
-  <!-- 状态 -->
-  <div class="panel">
-    <div class="ph"><b>节点健康状态</b><span class="mono" id="modeHint"></span></div>
-    <div class="pb" style="padding:0;overflow-x:auto">
-      <table>
-        <thead><tr>
-          <th>节点</th><th>DDNS 域名</th><th>解析 IP</th><th>权重</th><th>判断</th><th>自动切换</th><th>同步/状态</th><th></th>
-        </tr></thead>
-        <tbody id="nodeBody"><tr><td colspan="8" style="text-align:center;color:var(--dim)">加载中…</td></tr></tbody>
-      </table>
-    </div>
-  </div>
-
-  <div class="panel">
-    <div class="ph"><b>操作日志</b><span class="mono" id="logCount"></span></div>
-    <div class="pb logs" id="logBody"></div>
-  </div>
-
-  <footer>CF-GTM · 桃花酱出品 <a href="https://t.me/taohuayuang" target="_blank" rel="noopener">@taohuayuang</a> · 单文件 Flask 应用 · 状态仅保存在本机</footer>
-</div>
-
-<script>
-function esc(s){ return String(s==null?"":s).replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c])); }
-function dot(st){ const cls = st==="ok" ? "ok" : st==="fail" ? "bad" : "unk"; return `<span class="dot ${cls}"></span>`; }
-function badgeVerdict(v){
-  const ok = v==="正常";
-  const cls = ok ? "ok" : (v==="被墙" || v==="异常") ? "bad" : "";
-  return `<span class="badge ${cls}">${esc(v || "未知")}</span>`;
-}
-function fmtLat(x){ return (x===null||x===undefined) ? "-" : x+"ms"; }
-async function jget(u){
-  const r = await fetch(u);
-  if(r.status === 401){ location.href = "/login"; throw new Error("unauthorized"); }
-  if(!r.ok) throw new Error("HTTP "+r.status);
-  return r.json();
-}
-async function jpost(u,b){
-  const r = await fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b||{})});
-  if(r.status === 401){ location.href = "/login"; throw new Error("unauthorized"); }
-  return r.json();
-}
-async function jdel(u){ const r=await fetch(u,{method:"DELETE"}); return r.json(); }
-
-const MODE_LABEL = {failover:"主备切换", round_robin:"多 A 记录轮询", weighted:"按权重轮换"};
-const SYNC_CLS = {"已同步":"ok","待创建":"warn","待更新":"warn","待删除":"bad","已摘除":"bad"};
-
-function fillConfig(c){
-  document.getElementById("cfgRecord").value = c.record_name || "";
-  document.getElementById("cfgType").value = c.record_type || "CNAME";
-  document.getElementById("cfgZone").value = c.zone_id || "";
-  document.getElementById("cfgInterval").value = c.interval_seconds;
-  document.getElementById("cfgThreshold").value = c.fail_threshold;
-  document.getElementById("cfgMode").value = c.mode;
-  document.getElementById("cfgDecision").value = c.decision_mode;
-  document.getElementById("cfgSlice").value = c.slice_seconds;
-  document.getElementById("cfgTtl").value = c.record_ttl;
-  document.getElementById("cfgToken").placeholder = c.has_token ? "已配置（留空不修改）" : "未配置";
-  document.getElementById("cfgApiUrl").value = c.api_url || "";
-  document.getElementById("autoWindowEnabled").checked = !!(c.auto_window && c.auto_window.enabled);
-  document.getElementById("autoStart").value = (c.auto_window && c.auto_window.start) || "00:00";
-  document.getElementById("autoEnd").value = (c.auto_window && c.auto_window.end) || "23:59";
-  document.getElementById("autoCooldown").value = c.cooldown_minutes || 0;
-  syncModeOptions();
-}
-
-function syncModeOptions(){
-  const type = document.getElementById("cfgType").value;
-  const rr = document.getElementById("rrOption");
-  const modeSel = document.getElementById("cfgMode");
-  rr.disabled = (type === "CNAME");
-  if(type === "CNAME" && modeSel.value === "round_robin") modeSel.value = "weighted";
-}
-
-let lastConfig = null;
-async function loadConfig(){
-  try{ lastConfig = await jget("/api/config"); fillConfig(lastConfig); }catch(e){}
-}
-
-const WEIGHT_OPTS = [[4,"最高"],[3,"高"],[2,"中"],[1,"低"]];
-function weightSelect(w, target){
-  const opts = WEIGHT_OPTS.map(([v,label])=>`<option value="${v}" ${Number(w)===v?"selected":""}>${label}</option>`).join("");
-  return `<select onchange="saveWeight('${esc(target)}', this)">${opts}</select>`;
-}
-
-function openProbeModal(){ if(lastConfig) fillConfig(lastConfig); document.getElementById("probeModal").style.display="flex"; }
-function closeProbeModal(){ document.getElementById("probeModal").style.display="none"; }
-function openNodesModal(){ document.getElementById("nodesModal").style.display="flex"; }
-function closeNodesModal(){ document.getElementById("nodesModal").style.display="none"; }
-function openAutoModal(){ if(lastConfig) fillConfig(lastConfig); document.getElementById("autoModal").style.display="flex"; }
-function closeAutoModal(){ document.getElementById("autoModal").style.display="none"; }
-function openPwdModal(){ document.getElementById("pwdModal").style.display="flex"; }
-function closePwdModal(){ document.getElementById("pwdModal").style.display="none"; }
-
-async function savePassword(){
-  const msg = document.getElementById("pwdMsg");
-  const oldp = document.getElementById("pwdOld").value;
-  const newp = document.getElementById("pwdNew").value;
-  const conf = document.getElementById("pwdConfirm").value;
-  if(newp !== conf){ msg.className="msg bad"; msg.textContent="两次输入不一致"; return; }
-  const r = await jpost("/api/password", {old: oldp, new: newp});
-  msg.className = "msg " + (r.ok ? "ok" : "bad");
-  msg.textContent = r.ok ? "已更新，请刷新页面重新登录" : (r.msg || "失败");
-}
-
-async function saveAuto(){
-  const msg = document.getElementById("autoMsg");
-  const payload = {
-    auto_window: {
-      enabled: document.getElementById("autoWindowEnabled").checked,
-      start: document.getElementById("autoStart").value || "00:00",
-      end: document.getElementById("autoEnd").value || "23:59",
-    },
-    cooldown_minutes: parseInt(document.getElementById("autoCooldown").value||"0"),
-    slice_seconds: parseInt(document.getElementById("cfgSlice").value||"300"),
-  };
-  const r = await jpost("/api/config", payload);
-  msg.className = "msg " + (r.ok ? "ok" : "bad");
-  msg.textContent = r.ok ? "已保存" : (r.msg || "保存失败");
-  if(r.ok){ lastConfig = r.config; fillConfig(r.config); refresh(); }
-  setTimeout(()=>{ msg.textContent=""; }, 4000);
-}
-
-async function saveConfig(){
-  const msg = document.getElementById("cfgMsg");
-  const payload = {
-    interval_seconds: parseInt(document.getElementById("cfgInterval").value||"60"),
-    fail_threshold: parseInt(document.getElementById("cfgThreshold").value||"2"),
-    mode: document.getElementById("cfgMode").value,
-    decision_mode: document.getElementById("cfgDecision").value,
-    api_url: document.getElementById("cfgApiUrl").value.trim(),
-  };
-  const r = await jpost("/api/config", payload);
-  msg.className = "msg " + (r.ok ? "ok" : "bad");
-  msg.textContent = r.ok ? "已保存" : (r.msg || "保存失败");
-  if(r.ok){ lastConfig = r.config; fillConfig(r.config); refresh(); }
-  setTimeout(()=>{ msg.textContent=""; }, 4000);
-}
-
-function openDomainModal(){ document.getElementById("domainModal").style.display = "flex"; }
-function closeDomainModal(){ document.getElementById("domainModal").style.display = "none"; }
-
-async function saveDomain(){
-  const msg = document.getElementById("domainMsg");
-  const payload = {
-    record_name: document.getElementById("cfgRecord").value.trim(),
-    record_type: document.getElementById("cfgType").value,
-    zone_id: document.getElementById("cfgZone").value.trim(),
-    api_token: document.getElementById("cfgToken").value.trim(),
-    record_ttl: parseInt(document.getElementById("cfgTtl").value||"60"),
-  };
-  const r = await jpost("/api/config", payload);
-  msg.className = "msg " + (r.ok ? "ok" : "bad");
-  msg.textContent = r.ok ? "已保存" : (r.msg || "保存失败");
-  if(r.ok){
-    document.getElementById("cfgToken").value = "";
-    lastConfig = r.config;
-    fillConfig(r.config);
-    refresh();
-  }
-  setTimeout(()=>{ msg.textContent=""; }, 4000);
-}
-
-async function testCF(){
-  const msg = document.getElementById("domainMsg");
-  msg.className = "msg"; msg.textContent = "测试中…";
-  const r = await jpost("/api/test_cf", {});
-  if(r.ok){
-    msg.className = "msg ok";
-    msg.textContent = `连接成功，查到 ${r.count} 条记录：` + (r.records||[]).map(x=>x.type+" "+x.content).join(" / ");
-  } else {
-    msg.className = "msg bad"; msg.textContent = "失败：" + (r.msg||"");
-  }
-  setTimeout(()=>{ msg.textContent=""; }, 8000);
-}
-
-async function addNode(){
-  const msg = document.getElementById("nodeMsg");
-  const payload = {
-    name: document.getElementById("nodeName").value.trim(),
-    target: document.getElementById("nodeTarget").value.trim(),
-    port: parseInt(document.getElementById("nodePort").value||"443"),
-    weight: parseInt(document.getElementById("nodeWeight").value||"1"),
-    enabled: document.getElementById("nodeEnabled").checked,
-  };
-  if(!payload.target){ msg.className="msg bad"; msg.textContent="请填写域名"; return; }
-  const r = await jpost("/api/nodes", payload);
-  msg.className = "msg " + (r.ok ? "ok" : "bad");
-  msg.textContent = r.ok ? "已添加" : (r.msg || "添加失败");
-  if(r.ok){ document.getElementById("nodeName").value=""; document.getElementById("nodeTarget").value=""; refresh(); }
-  setTimeout(()=>{ msg.textContent=""; }, 4000);
-}
-
-async function delNode(target){
-  if(!confirm("确认删除节点 "+target+" ？")) return;
-  await jdel("/api/nodes?target="+encodeURIComponent(target));
-  refresh();
-}
-
-async function saveWeight(target, el){
-  const w = parseInt(el.value||"1");
-  const r = await jpost("/api/nodes/update", {target: target, weight: w});
-  if(!r.ok) alert("保存失败："+(r.msg||""));
-  refresh();
-}
-
-async function refresh(){
-  try{
-    const s = await jget("/api/status");
-    const rr = s.mode === "round_robin", wd = s.mode === "weighted";
-    document.getElementById("modeBadge").textContent = MODE_LABEL[s.mode] || s.mode;
-    document.getElementById("modeBadge").className = "badge " + (rr || wd ? "ok" : "");
-    document.getElementById("modeHint").textContent =
-      wd ? "weighted：按权重分配解析时间片，故障立即切换" :
-      rr ? "round_robin：多 A 记录等概率，故障摘除记录" :
-      "failover：当前节点故障后切换到健康节点";
-    document.getElementById("curTarget").textContent = s.current || "-";
-    document.getElementById("probeCfg").textContent = s.interval+"s / "+s.threshold+" 次";
-    document.getElementById("lastRound").textContent = s.last_round || "尚未探测";
-    document.getElementById("autoSwitch").checked = !!s.auto_switch;
-    document.getElementById("dryBadge").style.display = s.dry_run ? "" : "none";
-
-    const cfBadge = document.getElementById("cfBadge");
-    if(s.cf_error){ cfBadge.className="badge bad"; cfBadge.textContent="CF 异常"; }
-    else if(!s.has_token){ cfBadge.className="badge"; cfBadge.textContent="CF 未配置"; }
-    else { cfBadge.className="badge ok"; cfBadge.textContent = s.dry_run ? "CF 已连接 · 演练" : "CF 已连接"; }
-
-    const svc = document.getElementById("svcState");
-    if(rr){
-      const n = s.nodes.filter(x=>x.healthy===true).length;
-      svc.textContent = n > 0 ? (n+" 个节点在线") : "全部异常";
-      svc.style.color = n > 0 ? "var(--ok)" : "var(--bad)";
-    } else {
-      const curNode = s.nodes.find(n=>n.current);
-      if(!curNode){
-        svc.textContent = s.current ? ("指向 " + s.current) : "未知";
-        svc.style.color = "var(--warn)";
-      }
-      else if(curNode.healthy){ svc.textContent="正常"; svc.style.color="var(--ok)"; }
-      else if(curNode.fail >= s.threshold){ svc.textContent="异常（已触发切换）"; svc.style.color="var(--bad)"; }
-      else { svc.textContent="异常（等待确认）"; svc.style.color="var(--warn)"; }
-    }
-
-    nodesOrder = s.nodes.map(n=>n.target);
-
-    const tb = document.getElementById("nodeBody");
-    if(!s.nodes.length){ tb.innerHTML='<tr><td colspan="8" style="text-align:center;color:var(--dim)">还没有节点，先在上方添加</td></tr>'; }
-    else {
-      tb.innerHTML = s.nodes.map(n=>{
-        const api = n.api||{}, tcp = n.tcp||{};
-        const lat = tcp.latency || api.latency;
-        const syncCls = SYNC_CLS[n.sync] || "";
-        return `<tr class="${n.current&&!rr?'cur':''}">
-          <td><b>${esc(n.name)}</b></td>
-          <td class="mono">${esc(n.target)}:${n.port}</td>
-          <td class="mono">${esc(n.ip||"-")}</td>
-          <td>${s.mode==="weighted" ? weightSelect(n.weight, n.target) : '<span class="mono">-</span>'}</td>
-          <td>${badgeVerdict(n.verdict)}</td>
-          <td><label class="switch mini"><input type="checkbox" ${n.enabled ? "checked" : ""} onchange="toggleNodeEnabled('${esc(n.target)}', this)"><span class="slider"></span></label></td>
-          <td>${s.mode==="round_robin" && n.sync ? `<span class="badge ${syncCls}">${esc(n.sync)}</span>` : '<span class="mono">-</span>'}</td>
-          <td class="toolbar">
-            ${n.current&&!rr ? '<span class="badge ok">当前</span>' : (!rr ? `<button onclick="switchTo('${esc(n.target)}')">切到此</button>` : '')}
-            <button onclick="moveNode('${esc(n.target)}', -1)" title="上移">↑</button>
-            <button onclick="moveNode('${esc(n.target)}', 1)" title="下移">↓</button>
-            <button class="danger" onclick="delNode('${esc(n.target)}')">删除</button>
-          </td>
-        </tr>`;
-      }).join("");
-    }
-
-    const lb = document.getElementById("logBody");
-    lb.innerHTML = (s.logs||[]).map(l=>`<div class="log"><span class="t">${esc(l.ts)}</span><span class="m ${esc(l.level)}">${esc(l.msg)}</span></div>`).join("") || '<div style="color:var(--dim)">暂无日志</div>';
-    document.getElementById("logCount").textContent = (s.logs||[]).length + " 条";
-  }catch(e){ console.error(e); }
-}
-
-async function probeNow(){ await jpost("/api/probe"); setTimeout(refresh, 800); }
-async function switchTo(t){
-  if(!confirm("确认把主域名切换到 "+t+" ？")) return;
-  const r = await jpost("/api/switch", {target:t});
-  if(!r.ok) alert("切换失败："+(r.msg||""));
-  refresh();
-}
-async function toggleAuto(el){ await jpost("/api/auto", {enabled: el.checked}); refresh(); }
-
-let nodesOrder = [];
-async function moveNode(target, delta){
-  const arr = [...nodesOrder];
-  const i = arr.indexOf(target), j = i + delta;
-  if(i < 0 || j < 0 || j >= arr.length) return;
-  [arr[i], arr[j]] = [arr[j], arr[i]];
-  const r = await jpost("/api/nodes/reorder", {order: arr});
-  if(r.ok) refresh();
-}
-
-async function toggleNodeEnabled(target, el){
-  const r = await jpost("/api/nodes/update", {target, enabled: el.checked});
-  if(!r.ok){ alert("保存失败："+(r.msg||"")); el.checked = !el.checked; }
-  refresh();
-}
-
-loadConfig();
-refresh();
-["domainModal","probeModal","nodesModal","autoModal","pwdModal"].forEach(function(id){
-  const el = document.getElementById(id);
-  el.addEventListener("click", function(e){ if(e.target === this) this.style.display="none"; });
-});
-setInterval(refresh, 5000);
-</script>
-</body>
-</html>
-"""
-
-
-LOGIN_PAGE = r"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CF-GTM · 登录</title>
-<style>
-:root{--bg:#0b1220;--panel:#121c2e;--panel2:#0f1828;--line:#22314b;
-  --txt:#e6edf7;--dim:#8ba0bf;--acc:#3b82f6;--bad:#ef4444}
-*{box-sizing:border-box}
-body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
-  background:radial-gradient(1200px 600px at 50% -10%,#15213a 0%,var(--bg) 60%);
-  color:var(--txt);font:14px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
-.card{width:min(380px,92vw);background:var(--panel);border:1px solid var(--line);border-radius:16px;
-  padding:30px 28px;box-shadow:0 24px 70px rgba(0,0,0,.5)}
-h1{font-size:21px;margin:0 0 4px;letter-spacing:.5px}
-h1 span{color:var(--acc)}
-.sub{color:var(--dim);font-size:12px;margin-bottom:22px}
-.sub a{color:var(--acc);text-decoration:none}
-label{display:block;color:var(--dim);font-size:12px;margin-bottom:8px}
-input{width:100%;background:var(--panel2);border:1px solid var(--line);color:var(--txt);
-  border-radius:10px;padding:11px 13px;font-size:14px;outline:none}
-input:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(59,130,246,.12)}
-button{width:100%;margin-top:16px;background:var(--acc);border:none;color:#fff;border-radius:10px;
-  padding:11px;font-size:14px;cursor:pointer;transition:.15s}
-button:hover{filter:brightness(1.1)}
-button:active{transform:translateY(1px)}
-.err{color:var(--bad);font-size:12px;margin-top:10px;min-height:18px}
-footer{color:var(--dim);font-size:11px;text-align:center;margin-top:22px}
-</style>
-</head>
-<body>
-<div class="card">
-  <h1>CF<span>-GTM</span> · 登录</h1>
-  <div class="sub">桃花酱出品 · <a href="https://t.me/taohuayuang" target="_blank" rel="noopener">@taohuayuang</a></div>
-  <label>面板密码</label>
-  <input id="pwd" type="password" autofocus placeholder="请输入密码" onkeydown="if(event.key==='Enter')doLogin()">
-  <button onclick="doLogin()">登 录</button>
-  <div class="err" id="err"></div>
-  <footer>Cloudflare DNS 流量调度控制台</footer>
-</div>
-<script>
-async function doLogin(){
-  const pwd = document.getElementById("pwd").value;
-  const err = document.getElementById("err");
-  err.textContent = "";
-  if(!pwd){ err.textContent = "请输入密码"; return; }
-  try{
-    const r = await fetch("/login", {method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({password:pwd})});
-    const j = await r.json();
-    if(j.ok){ location.href = "/"; }
-    else { err.textContent = j.msg || "密码错误"; document.getElementById("pwd").select(); }
-  }catch(e){ err.textContent = "请求失败，请重试"; }
-}
-</script>
-</body>
-</html>
-"""
+    data = json_body()
+    target = hostname(data.get("target"))
+    candidate = copy.deepcopy(config)
+    node = next((item for item in candidate["nodes"] if item["target"] == target), None)
+    if node is None:
+        return jsonify({"ok": False, "msg": "节点不存在"}), 404
+    for key in ("name", "port", "weight", "enabled"):
+        if key in data:
+            node[key] = data[key]
+    commit_config(candidate)
+    return jsonify({"ok": True})
 
 # ---------------------------------------------------------------- 启动
 
-_initialized = False
 
-
-def init_app() -> None:
-    """幂等初始化：python app.py 或 gunicorn 导入 app 时都会执行。"""
-    global _initialized
-    if _initialized:
-        return
-    _initialized = True
-
-    load_config()
-    app.secret_key = config["web"]["secret"]
-    state["started_at"] = now_str()
-
-    log("=" * 56)
-    log("CF-GTM 启动")
-    log("桃花酱出品 · @taohuayuang")
-    log(f"主域名：{config['cloudflare'].get('record_name')} | 模式：{config.get('mode')}")
-    log(f"节点数：{len(config.get('nodes') or [])} | 判定：{config['probe'].get('decision_mode')} | DRY-RUN：{config.get('dry_run')}")
-    log("=" * 56)
-
-    refresh_from_cf()
-    threading.Thread(target=probe_loop, daemon=True).start()
-
-    if (config.get("web") or {}).get("password"):
-        log("Web 控制台已启用登录密码")
-    else:
-        log("Web 控制台未设置密码，建议仅在内网使用", "warn")
-
-
-# 模块级初始化：gunicorn 导入时也会启动探测线程（gunicorn 请用 workers=1）
-init_app()
+def init_app(start_background=False, refresh=False) -> None:
+    global _initialized, _background_thread
+    with operation_lock:
+        if not _initialized:
+            load_config()
+            app.secret_key = config["web"]["secret"]
+            app.config["SESSION_COOKIE_SECURE"] = config["web"].get("cookie_secure", False)
+            with lock:
+                state["started_at"] = now_str()
+            _initialized = True
+            log(f"CF-GTM 启动 | 模式 {config['mode']} | 节点 {len(config['nodes'])} | 自动切换 {'开' if config['auto_switch'] else '关'}")
+        if refresh:
+            refresh_from_cf()
+        if start_background and (_background_thread is None or not _background_thread.is_alive()):
+            stop_event.clear()
+            _background_thread = threading.Thread(target=probe_loop, daemon=True, name="gtm-probe-loop")
+            _background_thread.start()
 
 
 def main() -> None:
-    web = config.get("web") or {}
-    host = web.get("host", "0.0.0.0")
-    port = int(web.get("port", 8787))
-
-    app.run(host=host, port=port, threaded=True, use_reloader=False)
+    init_app(start_background=True, refresh=True)
+    web = config["web"]
+    app.run(host=web["host"], port=web["port"], threaded=True, use_reloader=False)
 
 
 if __name__ == "__main__":

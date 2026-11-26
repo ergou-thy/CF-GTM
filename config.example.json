@@ -1,7 +1,7 @@
 {
   "cloudflare": {
-    "api_token": "YOUR_CF_API_TOKEN",
-    "zone_id": "YOUR_ZONE_ID",
+    "api_token": "",
+    "zone_id": "",
     "record_name": "ddns.example.com",
     "record_type": "CNAME"
   },
@@ -22,13 +22,9 @@
     "end": "23:59"
   },
   "cooldown_minutes": 0,
-  "nodes": [
-    {"name": "日本1", "target": "jp1.example.com", "port": 443, "weight": 3, "enabled": true},
-    {"name": "日本2", "target": "jp2.example.com", "port": 443, "weight": 2, "enabled": true},
-    {"name": "新加坡1", "target": "sg1.example.com", "port": 443, "weight": 1, "enabled": true}
-  ],
+  "nodes": [],
   "mode": "weighted",
-  "auto_switch": true,
+  "auto_switch": false,
   "dry_run": true,
   "web": {
     "host": "127.0.0.1",

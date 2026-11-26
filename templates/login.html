@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="csrf-token" content="{{ csrf_token }}"><meta name="color-scheme" content="light"><meta name="theme-color" content="#fbf9f6">
+<title>登录 · 桃花源 GTM</title>
+<link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}?v={{ asset_version }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}?v={{ asset_version }}">
+<script defer src="{{ url_for('static', filename='login.js') }}?v={{ asset_version }}"></script>
+</head>
+<body class="login-page">
+<main class="login-shell">
+<a class="brand login-brand" href="/login" aria-label="桃花源 GTM 登录"><span class="brand-mark"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M16 15C4 13 6 1 13 5c3 1 3 6 3 10Zm1 0C14 3 26 1 26 9c0 3-5 5-9 6Zm1 2C28 9 34 20 27 23c-3 1-7-2-9-6Zm-2 1c10 8 1 17-4 11-2-3 0-7 4-11Zm-2-1C9 29-2 23 3 17c2-3 7-2 11 0Z"/><circle cx="16" cy="16" r="2"/></svg></span><span><strong>桃花源</strong><span class="brand-caption">GTM 管理控制台</span></span></a>
+<section class="login-card" aria-labelledby="loginHeading"><p class="eyebrow">欢迎回来</p><h1 id="loginHeading">登录管理控制台</h1><p class="login-description">使用面板密码，管理节点与 DNS 调度。</p>
+<form id="loginForm" method="post" action="/login"><div class="field"><label for="pwd">面板密码</label><div class="password-control"><input id="pwd" name="password" type="password" required autocomplete="current-password" placeholder="请输入面板密码" aria-describedby="err" autofocus><button type="button" id="togglePassword" aria-label="显示密码" aria-pressed="false">显示</button></div></div><p class="login-error" id="err" role="alert" aria-live="polite"></p><button class="button primary full-button login-submit" id="loginButton" type="submit">进入控制台<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5"/></svg></button></form>
+<noscript><p class="login-error">请启用 JavaScript 后登录。</p></noscript><div class="login-note"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v3"/></svg><span>仅限授权管理人员访问</span></div></section>
+<footer class="login-footer">桃花酱出品 <span aria-hidden="true">·</span> Cloudflare DNS 流量调度</footer>
+</main>
+</body></html>
