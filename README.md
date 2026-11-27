@@ -11,6 +11,22 @@ CF-GTM 是一个可自托管的 Cloudflare DNS 调度工具：定时检查节点
 
 **这是 DNS 层调度，不是连接级负载均衡。** DNS 缓存、TTL、递归解析器和客户端选址会影响实际流量；修改解析不会迁移已有连接，权重也不代表精确的请求或带宽比例。
 
+## 界面预览
+
+以下截图使用示例域名和演示数据。
+
+### 运行总览
+
+![GTM 运行总览](docs/images/gtm-overview-desktop.png)
+
+### 节点管理
+
+![GTM 节点管理](docs/images/gtm-nodes-desktop.png)
+
+### 手机端
+
+![GTM 手机端运行总览](docs/images/gtm-overview-mobile.png)
+
 ## 功能与边界
 
 | 能力 | 实际行为 |
